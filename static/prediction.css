@@ -1,0 +1,18 @@
+/* Prediction view in the comparison dashboard */
+.prediction-filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); align-items: end; gap: 8px; }
+.prediction-filter-grid .field select { min-height: 30px; padding: 4px 8px; }
+.prediction-dynamic-fields { display: contents; }
+#comparison-view:not(.show-prediction-controls) .comparison-prediction-controls { display: none; }
+#comparison-content[data-view="numbers"] .comparison-prediction-only,
+#comparison-content[data-view="charts"] .comparison-prediction-only { display: none; }
+#comparison-content[data-view="prediction"] .comparison-charts-only,
+#comparison-content[data-view="prediction"] .comparison-numbers-only { display: none; }
+#prediction-content[data-view="numbers"] .prediction-charts-only { display: none; }
+#prediction-content[data-view="charts"] .prediction-numbers-only { display: none; }
+#prediction-content .kpi-sub .negative { color: var(--red); font-weight: 750; }
+.prediction-target-dot { background: #9fb2bf; }
+.prediction-table td { white-space: nowrap; }
+.prediction-forecast-row th, .prediction-forecast-row td { background: #fff6ea; }
+.prediction-forecast-cell { color: #8d5a24 !important; }
+.prediction-services-card { margin-top: 10px; }
+#prediction-content .chart-wrap { height: 210px; }

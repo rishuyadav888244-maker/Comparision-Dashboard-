@@ -1,0 +1,893 @@
+import tempfile
+import unittest
+import warnings
+import base64
+import json
+import re
+import zlib
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import patch
+
+import pandas as pd
+
+import backend
+import dashboard_service
+import database
+
+
+class WebDashboardServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_database_path = database.DATABASE_PATH
+        database.DATABASE_PATH = Path(self.temp_dir.name) / "dashboard-test.db"
+        database.init_database()
+        self.rows_2025 = pd.DataFrame([
+            {
+                "DOA": "05/01/2025", "DOD": "08/01/2025", "Month": "January",
+                "Dept. Name": "Medicine", "Doctor Name": "Dr A", "Panel Name": "Panel A",
+                "Type": "Discharge", "Service Type": "Consultation",
+                "Service Name": "Consultation", "Service Final Amount": 1000,
+                "Cash Due": 200, "Credit Due": 100, "Bed Days": 3, "UHID": "U1",
+            },
+            {
+                "DOA": "09/01/2025", "DOD": None, "Month": "January",
+                "Dept. Name": "Medicine", "Doctor Name": "Dr A", "Panel Name": "Panel A",
+                "Type": "OPD", "Service Type": "Consultation",
+                "Service Name": "Consultation", "Service Final Amount": 250,
+                "Cash Due": 0, "Credit Due": 0, "Bed Days": 0, "UHID": "U2",
+            },
+        ])
+        self.rows_2026 = pd.DataFrame([
+            {
+                "DOA": "05/01/2026", "DOD": "08/01/2026", "Month": "January",
+                "Dept. Name": "Surgery", "Doctor Name": "Dr B", "Panel Name": "Panel B",
+                "Type": "Discharge", "Service Type": "Consultation",
+                "Service Name": "Consultation", "Service Final Amount": 2000,
+                "Cash Due": 100, "Credit Due": 50, "Bed Days": 2, "UHID": "U3",
+            },
+            {
+                "DOA": "09/01/2026", "DOD": None, "Month": "January",
+                "Dept. Name": "Surgery", "Doctor Name": "Dr B", "Panel Name": "Panel B",
+                "Type": "OPD", "Service Type": "Lab",
+                "Service Name": "Blood Test", "Service Final Amount": 500,
+                "Cash Due": 0, "Credit Due": 0, "Bed Days": 0, "UHID": "U4",
+            },
+        ])
+        database.save_hospital_data(self.rows_2025, "Surya Hospital", "surya-2025.xlsx", b"2025")
+        database.save_hospital_data(self.rows_2026, "Surya Hospital", "surya-2026.xlsx", b"2026")
+
+    def tearDown(self):
+        database.DATABASE_PATH = self.original_database_path
+        self.temp_dir.cleanup()
+
+    def test_opd_consultation_filter_normalizes_type_and_service_values(self):
+        frame = pd.DataFrame([
+            {"Type": " opd ", "Service Type": " Consultation ", "UHID": "U1"},
+            {"Type": "OPD", "Service Type": "Laboratory", "UHID": "U2"},
+            {"Type": "Discharge", "Service Type": "Consultation", "UHID": "U3"},
+            {"Type": None, "Service Type": None, "UHID": "U4"},
+        ])
+
+        consultations = backend.opd_consultation_records(frame)
+
+        self.assertEqual(consultations["UHID"].tolist(), ["U1"])
+
+    def test_dashboard_uses_existing_kpi_and_filter_calculations(self):
+        datasets = database.list_saved_datasets()
+        result = dashboard_service.get_dashboard({
+            "datasetId": datasets[-1]["dataset_id"],
+            "month": ["January"],
+            "period": ["1-10 Days"],
+        })
+        self.assertTrue(result["hasData"])
+        self.assertEqual(result["kpis"]["revenue"], 1250)
+        self.assertEqual(result["kpis"]["ipd_revenue"], 1000)
+        self.assertEqual(result["kpis"]["opd_revenue"], 250)
+        filtered_target = backend.DEFAULT_TARGET * 10 / 31
+        self.assertAlmostEqual(result["kpis"]["target"], filtered_target)
+        self.assertAlmostEqual(result["kpis"]["achievement"], 1250 / filtered_target * 100)
+        self.assertEqual(result["kpis"]["cash_due"], 200)
+        self.assertEqual(result["kpis"]["credit_due"], 100)
+        self.assertEqual(result["kpis"]["discharges"], 1)
+        self.assertEqual(result["kpis"]["bed_days"], 3)
+        self.assertEqual(result["kpis"]["admissions"], 0)
+        self.assertEqual(result["kpis"]["opd_consultation"], 1)
+        self.assertEqual(result["recordCount"], 2)
+        self.assertAlmostEqual(
+            sum(row["target"] for row in result["charts"]["targetProgress"]),
+            result["kpis"]["target"],
+        )
+        self.assertAlmostEqual(
+            result["charts"]["totals"]["targetProgress"]["target"],
+            result["kpis"]["target"],
+        )
+        self.assertAlmostEqual(
+            sum(row["actual"] for row in result["charts"]["targetProgress"]),
+            result["kpis"]["revenue"],
+        )
+        self.assertEqual(
+            [row["actual"] for row in result["charts"]["targetProgress"]],
+            [1250, 0, 0],
+        )
+        self.assertEqual(
+            [row["target"] for row in result["charts"]["targetProgress"]][1:],
+            [0, 0],
+        )
+        self.assertIn("revenueTrend", result["charts"])
+        self.assertEqual(result["charts"]["totals"]["revenueTrend"]["value"], 1000)
+        self.assertEqual(
+            result["charts"]["totals"]["patientFlow"],
+            {"Admissions": 0, "Discharges": 1},
+        )
+        self.assertEqual(result["charts"]["totals"]["opdDoctors"]["value"], 1)
+        self.assertEqual(result["charts"]["insights"]["department"], "Medicine")
+        self.assertEqual(
+            [item["label"] for item in result["charts"]["insights"]["items"]],
+            [
+                "Days daily target was met",
+                "Best earning day",
+                "Revenue from IPD vs OPD",
+                "Top earning department",
+                "Top earning doctor",
+                "Top paying panel",
+                "Payment still pending",
+                "OPD gross amount",
+                "OPD final amount (received)",
+                "OPD discount / concession",
+            ],
+        )
+
+    def test_overview_target_chart_scales_with_year_month_and_period_filters(self):
+        monthly_target = backend.monthly_revenue_target("Surya Hospital")
+        annual = dashboard_service._dashboard_target_by_period(
+            monthly_target,
+            pd.Timestamp("2025-01-01"),
+            pd.Timestamp("2025-12-31"),
+            [],
+            [],
+        )
+        self.assertAlmostEqual(
+            sum(annual.values()), monthly_target * 12, places=5
+        )
+        partial_year = dashboard_service._dashboard_target_by_period(
+            monthly_target,
+            pd.Timestamp("2025-01-01"),
+            pd.Timestamp("2025-08-31"),
+            [],
+            [],
+        )
+        self.assertAlmostEqual(
+            sum(partial_year.values()), monthly_target * 12, places=5
+        )
+
+        monthly = dashboard_service._dashboard_target_by_period(
+            monthly_target,
+            pd.Timestamp("2025-01-01"),
+            pd.Timestamp("2025-12-31"),
+            ["January"],
+            [],
+        )
+        self.assertAlmostEqual(sum(monthly.values()), monthly_target, places=5)
+
+        period = dashboard_service._dashboard_target_by_period(
+            monthly_target,
+            pd.Timestamp("2025-01-01"),
+            pd.Timestamp("2025-12-31"),
+            ["January"],
+            ["1-10 Days"],
+        )
+        self.assertAlmostEqual(
+            sum(period.values()), monthly_target * 10 / 31, places=5
+        )
+        self.assertAlmostEqual(
+            period["1-10 Days"], monthly_target * 10 / 31, places=5
+        )
+        self.assertEqual(period["11-20 Days"], 0)
+        self.assertEqual(period["21-31 Days"], 0)
+
+    @patch("prediction_service.get_prediction", return_value={"hasData": False, "message": "No data"})
+    def test_interactive_export_is_self_contained_and_omits_patient_ids(self, get_prediction):
+        html = dashboard_service.export_interactive_html()
+        text = html.decode("utf-8")
+        self.assertIn("Self-contained interactive report", text)
+        self.assertIn("function offlineComparison", text)
+        self.assertIn("function offlineComparisonCountTrend", text)
+        self.assertIn('"Last Months": "IPD revenue trend by month"', text)
+        self.assertIn('pathname === "/api/prediction"', text)
+        self.assertIn("function loadPrediction()", text)
+        self.assertIn(".comparison-prediction-only", text)
+        self.assertIn("window.__PREDICTION_REPORT_DATA__ = data", text)
+        self.assertIn('url.pathname.replace(/^\\/[A-Za-z]:/, "")', text)
+        self.assertIn('id="print-context"', text)
+        self.assertIn('window.addEventListener("beforeprint", updatePrintContext)', text)
+        self.assertIn(".comparison-controls .comparison-filter-grid", text)
+        self.assertIn(
+            ".comparison-compact-chart .comparison-column-value { display: flex; }",
+            text,
+        )
+        self.assertNotIn("Total revenue: ", text)
+        self.assertNotIn('label: "Monthly target"', text)
+        self.assertNotIn('label: "Target for this range"', text)
+        self.assertIn("<style>", text)
+        self.assertNotIn('/assets/dashboard.js', text)
+        self.assertNotIn('/assets/dashboard.css', text)
+        self.assertNotIn('/assets/prediction.js', text)
+        self.assertNotIn('/assets/prediction.css', text)
+        match = re.search(r'window\.__OFFLINE_BUNDLE__="([A-Za-z0-9+/=]+)"', text)
+        self.assertIsNotNone(match)
+        bundle = json.loads(zlib.decompress(base64.b64decode(match.group(1))))
+        self.assertEqual(len(bundle["datasets"]), 2)
+        self.assertEqual(len(bundle["rows"]), 4)
+        self.assertEqual(len(bundle["rows"][0]), 15)
+        self.assertNotIn("U1", json.dumps(bundle))
+        self.assertEqual(len(bundle["predictions"]), 96)
+        self.assertIn('["All Hospitals","Year","","","6"]', bundle["predictions"])
+        self.assertEqual(get_prediction.call_count, 32)
+
+    def test_offline_prediction_horizon_variants_match_live_predictions(self):
+        import prediction_service
+
+        for mode, month, period, full_horizon, shorter_horizon in (
+            ("Year", None, None, 12, 3),
+            ("Month", "January", None, 3, 1),
+            ("Period", None, "1-10 Days", 12, 6),
+        ):
+            with self.subTest(mode=mode):
+                full_filters = {
+                    "predictBy": mode,
+                    "horizon": str(full_horizon),
+                }
+                short_filters = {
+                    "predictBy": mode,
+                    "horizon": str(shorter_horizon),
+                }
+                if month:
+                    full_filters["month"] = short_filters["month"] = month
+                if period:
+                    full_filters["period"] = short_filters["period"] = period
+                full = prediction_service.get_prediction({
+                    "hospital": "Surya Hospital",
+                    "filters": full_filters,
+                })
+                actual_short = prediction_service.get_prediction({
+                    "hospital": "Surya Hospital",
+                    "filters": short_filters,
+                })
+                self.assertEqual(
+                    dashboard_service._prediction_horizon_variant(full, shorter_horizon),
+                    actual_short,
+                )
+
+    def test_revenue_insights_match_dashboard_summary_fields(self):
+        rows = pd.DataFrame([
+            {
+                "Type": "Discharge", "DOA": "01/01/2025", "DOD": "02/01/2025",
+                "Dept. Name": "Medicine", "Doctor Name": "Dr A", "Panel Name": "Panel A",
+                "Service Amount": 1200, "Service Final Amount": 1000,
+                "Credit Due": 200,
+            },
+            {
+                "Type": "OPD", "DOA": "03/01/2025", "DOD": None,
+                "Dept. Name": "Medicine", "Doctor Name": "Dr A", "Panel Name": "Panel A",
+                "Service Amount": 500, "Service Final Amount": 400,
+                "Credit Due": 0,
+            },
+        ])
+        result = backend.insights(rows, monthly_target=3100)
+        insights_by_label = {item["label"]: item["value"] for item in result["items"]}
+
+        self.assertEqual(len(result["items"]), 10)
+        self.assertEqual(insights_by_label["Days daily target was met"], "2 of 2 days")
+        self.assertEqual(insights_by_label["Revenue from IPD vs OPD"], "IPD 71% · OPD 29%")
+        self.assertEqual(
+            insights_by_label["Top earning department"],
+            "Medicine · ₹1,000 (100% of IPD revenue)",
+        )
+        self.assertEqual(insights_by_label["Payment still pending"], "₹200 (17% of IPD billing)")
+        self.assertEqual(insights_by_label["OPD gross amount"], "₹500")
+        self.assertEqual(
+            insights_by_label["OPD final amount (received)"], "₹400 (80% of gross)"
+        )
+        self.assertEqual(
+            insights_by_label["OPD discount / concession"], "₹100 (20% of gross)"
+        )
+
+    def test_comparison_returns_period_kpis_and_department_rows(self):
+        result = dashboard_service.get_comparison({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Year",
+                "year1": "2025",
+                "year2": "2026",
+                "month": "All Months",
+            },
+        })
+        self.assertEqual(result["recordCounts"], [2, 2])
+        revenue = next(metric for metric in result["metrics"] if metric["label"] == "Revenue")
+        self.assertEqual((revenue["first"], revenue["second"]), (1250, 2500))
+        self.assertEqual(len(result["metrics"]), 13)
+        ipd_revenue = next(metric for metric in result["metrics"] if metric["label"] == "IPD revenue")
+        opd_revenue = next(metric for metric in result["metrics"] if metric["label"] == "OPD revenue")
+        target = next(metric for metric in result["metrics"] if metric["label"] == "Revenue target")
+        achievement = next(metric for metric in result["metrics"] if metric["label"] == "Target achievement")
+        self.assertEqual((ipd_revenue["first"], ipd_revenue["second"]), (1000, 2000))
+        self.assertEqual((opd_revenue["first"], opd_revenue["second"]), (250, 500))
+        self.assertEqual((revenue["first"], revenue["second"]), (
+            ipd_revenue["first"] + opd_revenue["first"],
+            ipd_revenue["second"] + opd_revenue["second"],
+        ))
+        annual_target = backend.DEFAULT_TARGET * 12
+        self.assertEqual(target["first"], annual_target)
+        self.assertEqual(target["second"], annual_target)
+        self.assertAlmostEqual(achievement["first"], 1250 / annual_target * 100)
+        self.assertAlmostEqual(achievement["second"], 2500 / annual_target * 100)
+        self.assertEqual(result["summary"]["periodDays"], [365, 365])
+        self.assertEqual(result["summary"]["totalRevenue"], [1250, 2500])
+        self.assertEqual(result["summary"]["ipdRevenue"], [1000, 2000])
+
+    def test_comparison_includes_populated_trend_series(self):
+        result = dashboard_service.get_comparison({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Year",
+                "year1": "2025",
+                "year2": "2026",
+                "month": "All Months",
+            },
+        })
+        self.assertTrue(result["hasData"])
+        self.assertEqual(
+            set(result["trends"]),
+            {"admissions", "discharges", "opdConsultations", "revenue"},
+        )
+        for trend in result["trends"].values():
+            self.assertTrue(trend["rows"])
+            self.assertEqual(len(trend["rows"]), 12)
+        january_revenue = next(
+            row for row in result["trends"]["revenue"]["rows"]
+            if row["label"] == "Jan"
+        )
+        self.assertEqual((january_revenue["first"], january_revenue["second"]), (1000, 2000))
+        self.assertEqual(result["summary"]["opdRevenue"], [250, 500])
+        self.assertEqual(result["summary"]["ipdDischargeEffect"], 0)
+        self.assertEqual(result["summary"]["ipdBillPerDischargeEffect"], 1000)
+        self.assertEqual(result["summary"]["creditDue"], [100, 50])
+        self.assertEqual(result["summary"]["collectionRate"], [90, 97.5])
+        self.assertEqual(result["departments"][0]["Department"], "Medicine")
+        self.assertEqual(result["chartTotals"]["ipdRevenueDepartments"], [1000, 2000])
+        self.assertEqual(result["chartTotals"]["dischargeDepartments"], [1, 1])
+        self.assertEqual(result["chartTotals"]["opdDoctors"], [1, 0])
+        medicine_mover = next(
+            row for row in result["moverData"]["ipdRevenue"]["departments"]
+            if row["name"] == "Medicine"
+        )
+        self.assertEqual(medicine_mover["values"], [1000, 0])
+        medicine_discharge_mover = next(
+            row for row in result["moverData"]["ipdDischarges"]["departments"]
+            if row["name"] == "Medicine"
+        )
+        self.assertEqual(medicine_discharge_mover["values"], [1, 0])
+        medicine_consultation_mover = next(
+            row for row in result["moverData"]["opdConsultations"]["departments"]
+            if row["name"] == "Medicine"
+        )
+        self.assertEqual(medicine_consultation_mover["values"], [1, 0])
+        medicine_consultation_doctor = next(
+            row for row in result["moverData"]["opdConsultations"]["doctors"]
+            if row["name"] == "Dr A"
+        )
+        self.assertEqual(medicine_consultation_doctor["values"], [1, 0])
+        self.assertEqual(
+            set(result["chartTotals"]),
+            {
+                "dischargeDepartments", "dischargeDoctors",
+                "admissionDepartments", "admissionDoctors",
+                "ipdRevenueDepartments", "ipdRevenueDoctors",
+                "opdDoctors", "opdServices", "panels",
+            },
+        )
+        self.assertEqual(result["revenueTrend"]["totals"], [1000, 2000])
+
+    def test_comparison_restores_revenue_and_operational_breakdowns(self):
+        for year, department, doctor, panel in [
+            (2025, "Medicine", "Dr A", "Panel A"),
+            (2026, "Surgery", "Dr B", "Panel B"),
+        ]:
+            additions = pd.DataFrame([
+                {
+                    "DOA": f"10/01/{year}", "DOD": None, "Month": "January",
+                    "Dept. Name": department, "Doctor Name": doctor,
+                    "Panel Name": panel, "Type": "Admission",
+                    "Service Type": "", "Service Name": "",
+                    "Service Final Amount": 0, "Cash Due": 0, "Credit Due": 0,
+                    "Bed Days": 0, "UHID": f"Admission-{year}",
+                },
+                {
+                    "DOA": f"11/01/{year}", "DOD": None, "Month": "January",
+                    "Dept. Name": department, "Doctor Name": doctor,
+                    "Panel Name": panel, "Type": "OPD",
+                    "Service Type": "Lab", "Service Name": "Blood Test",
+                    "Service Final Amount": 300, "Cash Due": 0, "Credit Due": 0,
+                    "Bed Days": 0, "UHID": f"Service-{year}",
+                },
+            ])
+            database.save_hospital_data(
+                additions, "Surya Hospital", f"additional-{year}.xlsx",
+                f"additional-{year}".encode(),
+            )
+
+        result = dashboard_service.get_comparison({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Year", "year1": "2025", "year2": "2026",
+                "month": "All Months",
+            },
+        })
+
+        for metric in ("ipdDischarges", "ipdAdmissions", "opdConsultations"):
+            with self.subTest(metric=metric):
+                panel_row = next(
+                    row for row in result["moverData"][metric]["panels"]
+                    if row["name"] == "Panel A"
+                )
+                self.assertEqual(panel_row["values"], [1, 0])
+
+        self.assertEqual(result["recordCounts"], [4, 4])
+        self.assertEqual(
+            set(result["charts"]),
+            {
+                "dischargeDepartments", "dischargeDoctors", "admissionDepartments",
+                "admissionDoctors", "ipdRevenueDepartments", "ipdRevenueDoctors",
+                "opdDoctors", "panels", "services",
+            },
+        )
+        self.assertEqual(result["revenueTrend"]["totals"], [1000, 2000])
+        self.assertEqual(result["revenueTrend"]["rows"], [
+            {"label": "Jan", "first": 1000.0, "second": 2000.0},
+            {"label": "Feb", "first": 0, "second": 0},
+            {"label": "Mar", "first": 0, "second": 0},
+            {"label": "Apr", "first": 0, "second": 0},
+            {"label": "May", "first": 0, "second": 0},
+            {"label": "Jun", "first": 0, "second": 0},
+            {"label": "Jul", "first": 0, "second": 0},
+            {"label": "Aug", "first": 0, "second": 0},
+            {"label": "Sep", "first": 0, "second": 0},
+            {"label": "Oct", "first": 0, "second": 0},
+            {"label": "Nov", "first": 0, "second": 0},
+            {"label": "Dec", "first": 0, "second": 0},
+        ])
+        medicine_admissions = next(
+            row for row in result["admissionDepartments"]
+            if row["Dept. Name"] == "Medicine"
+        )
+        self.assertEqual(medicine_admissions[result["labels"][0]], 1)
+        medicine_discharges = next(
+            row for row in result["dischargeDepartments"]
+            if row["Dept. Name"] == "Medicine"
+        )
+        self.assertEqual(medicine_discharges[result["labels"][0]], 1)
+        chart_medicine_discharges = next(
+            row for row in result["charts"]["dischargeDepartments"]
+            if row["label"] == "Medicine"
+        )
+        self.assertEqual(
+            (chart_medicine_discharges["first"], chart_medicine_discharges["second"]),
+            (1, 0),
+        )
+        chart_dr_a_discharges = next(
+            row for row in result["charts"]["dischargeDoctors"]
+            if row["label"] == "Dr A"
+        )
+        self.assertEqual(
+            (chart_dr_a_discharges["first"], chart_dr_a_discharges["second"]),
+            (1, 0),
+        )
+        chart_medicine_admissions = next(
+            row for row in result["charts"]["admissionDepartments"]
+            if row["label"] == "Medicine"
+        )
+        self.assertEqual(
+            (chart_medicine_admissions["first"], chart_medicine_admissions["second"]),
+            (1, 0),
+        )
+        chart_dr_a_consultations = next(
+            row for row in result["charts"]["opdDoctors"]
+            if row["label"] == "Dr A"
+        )
+        self.assertEqual(
+            (chart_dr_a_consultations["first"], chart_dr_a_consultations["second"]),
+            (1, 0),
+        )
+        chart_surgery_revenue = next(
+            row for row in result["charts"]["ipdRevenueDepartments"]
+            if row["label"] == "Surgery"
+        )
+        self.assertEqual(
+            (chart_surgery_revenue["first"], chart_surgery_revenue["second"]),
+            (0, 2000),
+        )
+        chart_surgery_services = next(
+            row for row in result["charts"]["services"]
+            if row["label"] == "Blood Test"
+        )
+        self.assertEqual(
+            (chart_surgery_services["first"], chart_surgery_services["second"]),
+            (0, 2),
+        )
+        chart_panel_a = next(
+            row for row in result["charts"]["panels"]
+            if row["label"] == "Panel A"
+        )
+        self.assertEqual((chart_panel_a["first"], chart_panel_a["second"]), (1000, 0))
+        panel_a_mover = next(
+            row for row in result["moverData"]["ipdRevenue"]["panels"]
+            if row["name"] == "Panel A"
+        )
+        self.assertEqual(panel_a_mover["values"], [1000, 0])
+        self.assertEqual(
+            result["summary"]["biggestIpdRevenueMovers"]["panels"]["name"],
+            "Panel B",
+        )
+        self.assertEqual(
+            result["summary"]["biggestIpdRevenueMovers"]["panels"]["change"],
+            2000,
+        )
+        self.assertEqual(result["opdDoctors"][0]["Doctor Name"], "Dr A")
+        self.assertIn("Panel A", [row["Panel"] for row in result["panels"]])
+        self.assertTrue(result["services"])
+        self.assertIn("Blood Test", [row["Service"] for row in result["services"]])
+        first_period_insights = result["managementInsights"][result["labels"][0]]
+        self.assertEqual(first_period_insights["department"], "Medicine")
+        self.assertEqual(first_period_insights["doctor"], "Dr A")
+        self.assertEqual(first_period_insights["panel"], "Panel A")
+        self.assertEqual(first_period_insights["day"], "08-Jan-2025")
+        exported = dashboard_service.export_comparison_csv({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Year", "year1": "2025", "year2": "2026",
+                "month": "All Months",
+            },
+        }).decode("utf-8-sig")
+        self.assertIn("IPD revenue trend", exported)
+        self.assertIn("Panel IPD revenue", exported)
+        self.assertIn("Admissions by department", exported)
+        self.assertIn("OPD services", exported)
+        self.assertIn("Management insight", exported)
+
+    def test_comparison_supports_every_period_selection_mode(self):
+        selections = [
+            {
+                "compareBy": "Year", "year1": "2025", "year2": "2026",
+                "month": "All Months",
+            },
+            {
+                "compareBy": "Month", "year": "2026",
+                "month1": "January", "month2": "January",
+            },
+            {
+                "compareBy": "Week", "year": "2026", "month": "January",
+                "week1": "2", "week2": "2",
+            },
+            {
+                "compareBy": "Period", "year": "2026", "month": "January",
+                "period1": "1-10 Days", "period2": "1-10 Days",
+            },
+            {
+                "compareBy": "Date", "date1": "2026-01-08", "date2": "2026-01-08",
+            },
+            {
+                "compareBy": "From-To",
+                "start1": "2026-01-01", "end1": "2026-01-31",
+                "start2": "2026-01-01", "end2": "2026-01-31",
+            },
+        ]
+        expected_targets = [
+            backend.DEFAULT_TARGET * 12,
+            backend.DEFAULT_TARGET,
+            backend.DEFAULT_TARGET * 7 / 31,
+            backend.DEFAULT_TARGET * 10 / 31,
+            backend.DEFAULT_TARGET / 31,
+            backend.DEFAULT_TARGET,
+        ]
+        for filters, expected_target in zip(selections, expected_targets):
+            with self.subTest(mode=filters["compareBy"]):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    result = dashboard_service.get_comparison({
+                        "hospital": "Surya Hospital",
+                        "filters": filters,
+                    })
+                self.assertTrue(result["hasData"])
+                self.assertEqual(len(result["metrics"]), 13)
+                target = next(
+                    metric for metric in result["metrics"]
+                    if metric["label"] == "Revenue target"
+                )
+                self.assertAlmostEqual(target["first"], expected_target)
+                self.assertAlmostEqual(target["second"], expected_target)
+                self.assertNotEqual(result["labels"][0], result["labels"][1])
+                if filters["compareBy"] == "From-To":
+                    self.assertEqual(
+                        result["labels"], ["First period", "Second period"]
+                    )
+                elif filters["compareBy"] != "Year":
+                    self.assertIn("Period 1", result["labels"][0])
+                    self.assertIn("Period 2", result["labels"][1])
+                self.assertFalse(any(
+                    "DataFrame columns are not unique" in str(item.message)
+                    for item in caught
+                ))
+
+    def test_last_months_comparison_compares_consecutive_month_windows(self):
+        additions = []
+        for year, months, amount in (
+            (2025, (10, 11, 12), 1000),
+            (2026, (1, 2, 3), 2000),
+        ):
+            for month in months:
+                date_value = f"15/{month:02d}/{year}"
+                additions.append({
+                    "DOA": date_value, "DOD": date_value,
+                    "Month": pd.Timestamp(year, month, 1).strftime("%B"),
+                    "Dept. Name": "Medicine", "Doctor Name": "Dr A",
+                    "Panel Name": "Panel A", "Type": "Discharge",
+                    "Service Type": "Consultation", "Service Name": "Consultation",
+                    "Service Final Amount": amount, "Cash Due": 0, "Credit Due": 0,
+                    "Bed Days": 1, "UHID": f"U-{year}-{month}",
+                })
+        database.save_hospital_data(
+            pd.DataFrame(additions), "Surya Hospital", "monthly-comparison.xlsx",
+            b"monthly-comparison",
+        )
+
+        result = dashboard_service.get_comparison({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Last Months", "endYear": "2026",
+                "endMonth": "March", "monthsCount": "3",
+            },
+        })
+
+        self.assertTrue(result["hasData"])
+        self.assertEqual(result["labels"], ["Oct 2025 – Dec 2025", "Jan 2026 – Mar 2026"])
+        self.assertEqual(result["periodRanges"], [
+            ["2025-10-01", "2025-12-31"], ["2026-01-01", "2026-03-31"],
+        ])
+        ipd_revenue = next(
+            metric for metric in result["metrics"] if metric["label"] == "IPD revenue"
+        )
+        self.assertEqual([ipd_revenue["first"], ipd_revenue["second"]], [3000, 8000])
+        self.assertEqual(
+            [row["label"] for row in result["revenueTrend"]["rows"]],
+            ["Jan 2026", "Feb 2026", "Mar 2026"],
+        )
+        self.assertEqual(
+            [row["first"] for row in result["revenueTrend"]["rows"]],
+            [1000, 1000, 1000],
+        )
+        self.assertEqual(
+            [row["second"] for row in result["revenueTrend"]["rows"]],
+            [4000, 2000, 2000],
+        )
+        self.assertEqual(dashboard_service.comparison_options()["latestDate"], "2026-03-15")
+        expected_ranges = {
+            3: [["2025-10-01", "2025-12-31"], ["2026-01-01", "2026-03-31"]],
+            4: [["2025-09-01", "2025-12-31"], ["2026-01-01", "2026-04-30"]],
+            6: [["2025-07-01", "2025-12-31"], ["2026-01-01", "2026-06-30"]],
+        }
+        for count, expected in expected_ranges.items():
+            with self.subTest(months=count):
+                filters = {
+                    "compareBy": "Last Months", "endYear": "2026",
+                    "endMonth": {3: "March", 4: "April", 6: "June"}[count],
+                    "monthsCount": str(count),
+                }
+                self.assertEqual(
+                    [
+                        [
+                            start.strftime("%Y-%m-%d"),
+                            end.strftime("%Y-%m-%d"),
+                        ]
+                        for start, end in (
+                            dashboard_service._comparison_target_range(filters, "1"),
+                            dashboard_service._comparison_target_range(filters, "2"),
+                        )
+                    ],
+                    expected,
+                )
+                comparison = dashboard_service.get_comparison({
+                    "hospital": "Surya Hospital",
+                    "filters": filters,
+                })
+                self.assertTrue(comparison["hasData"])
+                self.assertEqual(len(comparison["revenueTrend"]["rows"]), count)
+        with self.assertRaisesRegex(ValueError, "3-, 4-, or 6-month"):
+            dashboard_service.get_comparison({
+                "hospital": "Surya Hospital",
+                "filters": {
+                    "compareBy": "Last Months", "endYear": "2026",
+                    "endMonth": "March", "monthsCount": "2",
+                },
+            })
+
+    def test_period_comparison_shows_selected_billing_ranges_together(self):
+        existing_periods = dashboard_service.get_comparison({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Period",
+                "year": "2026",
+                "month": "January",
+                "period": "All Periods",
+            },
+        })
+        self.assertEqual(existing_periods["labels"], backend.PERIOD_OPTIONS)
+        self.assertEqual(existing_periods["summary"]["periodDays"], [10, 11])
+        self.assertEqual(
+            existing_periods["summary"]["ipdRevenue"], [2000, 0]
+        )
+        self.assertEqual(
+            next(
+                metric for metric in existing_periods["metrics"]
+                if metric["label"] == "IPD revenue"
+            )["values"],
+            [2000, 0, 0],
+        )
+        self.assertEqual(existing_periods["recordCounts"], [2, 0, 0])
+        self.assertEqual(
+            existing_periods["revenueTrend"]["rows"][0]["first"], 2000
+        )
+        self.assertEqual(
+            existing_periods["revenueTrend"]["rows"][0]["second"], 0
+        )
+        first_period_mover = next(
+            row for row in existing_periods["moverData"]["ipdRevenue"]["departments"]
+            if row["name"] == "Surgery"
+        )
+        self.assertEqual(first_period_mover["values"], [2000, 0, 0])
+
+        extra_rows = pd.DataFrame([
+            {
+                "DOA": "14/01/2026", "DOD": "15/01/2026", "Month": "January",
+                "Dept. Name": "Medicine", "Doctor Name": "Dr A", "Panel Name": "Panel A",
+                "Type": "Discharge", "Service Type": "Consultation",
+                "Service Name": "Consultation", "Service Final Amount": 1500,
+                "Cash Due": 100, "Credit Due": 0, "Bed Days": 1, "UHID": "U5",
+            },
+            {
+                "DOA": "24/01/2026", "DOD": "25/01/2026", "Month": "January",
+                "Dept. Name": "Surgery", "Doctor Name": "Dr B", "Panel Name": "Panel B",
+                "Type": "Discharge", "Service Type": "Consultation",
+                "Service Name": "Consultation", "Service Final Amount": 2500,
+                "Cash Due": 200, "Credit Due": 0, "Bed Days": 1, "UHID": "U6",
+            },
+        ])
+        database.save_hospital_data(
+            extra_rows, "Surya Hospital", "surya-january-periods.xlsx", b"periods"
+        )
+
+        result = dashboard_service.get_comparison({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Period",
+                "year": "2026",
+                "month": "January",
+                "period": "All Periods",
+            },
+        })
+
+        self.assertTrue(result["hasData"])
+        self.assertEqual(result["labels"], backend.PERIOD_OPTIONS)
+        revenue = next(metric for metric in result["metrics"] if metric["label"] == "IPD revenue")
+        self.assertEqual(revenue["values"], [2000, 1500, 2500])
+        medicine_mover = next(
+            row for row in result["moverData"]["ipdRevenue"]["departments"]
+            if row["name"] == "Medicine"
+        )
+        self.assertEqual(medicine_mover["values"], [0, 1500, 0])
+        self.assertEqual(len(result["chartTotals"]["dischargeDepartments"]), 3)
+        self.assertEqual(len(result["revenueTrend"]["totals"]), 3)
+        discharge_rows = result["charts"]["dischargeDepartments"]
+        self.assertTrue(all(
+            any(key in row for row in discharge_rows)
+            for key in ("first", "second", "third")
+        ))
+        exported = pd.read_csv(BytesIO(dashboard_service.export_comparison_csv({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Period",
+                "year": "2026",
+                "month": "January",
+                "period": "All Periods",
+            },
+        })))
+        revenue_export = exported.loc[
+            exported["Label"] == "IPD revenue"
+        ].iloc[0]
+        self.assertEqual(
+            [float(revenue_export[period]) for period in backend.PERIOD_OPTIONS],
+            [2000, 1500, 2500],
+        )
+
+        one_period = dashboard_service.get_comparison({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Period",
+                "year": "2026",
+                "month": "January",
+                "period": "11-20 Days",
+            },
+        })
+        self.assertTrue(one_period["hasData"])
+        self.assertEqual(one_period["labels"], ["11-20 Days"])
+        self.assertEqual(
+            next(metric for metric in one_period["metrics"] if metric["label"] == "IPD revenue")["values"],
+            [1500],
+        )
+
+    def test_comparison_uses_hospital_specific_monthly_revenue_targets(self):
+        database.save_hospital_data(
+            self.rows_2025, "NIMMS Hospital", "nimms-2025.xlsx", b"nimms-2025"
+        )
+        database.save_hospital_data(
+            self.rows_2026, "NIMMS Hospital", "nimms-2026.xlsx", b"nimms-2026"
+        )
+        result = dashboard_service.get_comparison({
+            "hospital": "NIMMS Hospital",
+            "filters": {
+                "compareBy": "Year", "year1": "2025", "year2": "2026",
+                "month": "All Months",
+            },
+        })
+        target = next(
+            metric for metric in result["metrics"]
+            if metric["label"] == "Revenue target"
+        )
+        self.assertEqual(target["first"], 25_000_000 * 12)
+        self.assertEqual(target["second"], 25_000_000 * 12)
+        self.assertEqual(backend.monthly_revenue_target("Surya Hospital"), 50_000_000)
+        self.assertEqual(backend.monthly_revenue_target("All Hospitals"), 75_000_000)
+
+    def test_upload_excel_validates_and_saves_workbook(self):
+        workbook = BytesIO()
+        self.rows_2025.to_excel(workbook, index=False)
+        result = dashboard_service.upload_excel("NIMMS-upload.xlsx", workbook.getvalue())
+        self.assertEqual(result["hospital_name"], "NIMMS Hospital")
+        self.assertEqual(result["inserted"], 2)
+        self.assertTrue(any(item["dataset_id"] == result["dataset_id"] for item in database.list_saved_datasets()))
+
+    def test_upload_rejects_non_excel_files(self):
+        with self.assertRaisesRegex(ValueError, "Excel workbook"):
+            dashboard_service.upload_excel("records.csv", b"record")
+
+    def test_comparison_frame_is_reused_between_dashboard_requests(self):
+        dashboard_service._cached_master_frame.cache_clear()
+        dashboard_service._cached_comparison_options.cache_clear()
+        years = [2025, 2026]
+        comparison_query = {
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "Year",
+                "year1": str(years[0]),
+                "year2": str(years[1]),
+                "month": "All Months",
+            },
+        }
+        with patch.object(
+            database, "load_all_hospital_data", wraps=database.load_all_hospital_data
+        ) as load_master:
+            options = dashboard_service.dashboard_options()
+            self.assertEqual(options["comparison"]["years"], years)
+            dashboard_service.comparison_options()
+            dashboard_service.get_comparison(comparison_query)
+            self.assertEqual(load_master.call_count, 1)
+
+    def test_initial_dashboard_options_include_comparison_years(self):
+        dashboard_service._cached_comparison_options.cache_clear()
+        options = dashboard_service.dashboard_options()
+        self.assertEqual(options["comparison"]["years"], [2025, 2026])
+        self.assertIn("January", options["comparison"]["months"])
+
+
+if __name__ == "__main__":
+    unittest.main()
