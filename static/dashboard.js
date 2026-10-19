@@ -197,6 +197,7 @@ function setView(name) {
   });
   $("#overview-view").classList.toggle("is-hidden", name !== "overview");
   $("#comparison-view").classList.toggle("is-hidden", name !== "comparison");
+  updateHeaderDateRange();
   if (name === "overview") scheduleCharts();
   if (name === "comparison" && state.comparisonData && !state.comparisonData.isZeroState) {
     scheduleComparisonChart();
@@ -449,9 +450,7 @@ function renderDashboard(data) {
     renderNoData();
     return;
   }
-  const start = data.dateRange.start;
-  const end = data.dateRange.end;
-  $("#date-range").textContent = `${dateText(start)} – ${dateText(end)}`;
+  updateHeaderDateRange();
   renderKpis(data.kpis);
   renderInsights(data.charts.insights, data.charts, data.kpis);
   drawDashboardCharts(data.charts);
@@ -1609,11 +1608,32 @@ function renderComparison(data) {
   $("#comparison-value-popup")?.classList.add("is-hidden");
   $("#comparison-content").classList.remove("is-hidden");
   state.comparisonData = data;
+  updateHeaderDateRange();
   renderComparisonKpis(data);
   renderComparisonMovers(data);
   renderComparisonInsights(data);
   if (state.comparisonView === "numbers") renderComparisonTrendTables(data);
   setComparisonView(state.comparisonView);
+}
+
+function updateHeaderDateRange() {
+  const header = $("#date-range");
+  const activeView = document.querySelector(".view-tab.is-active")?.dataset.view || "overview";
+  if (activeView === "comparison") {
+    const ranges = state.comparisonData?.periodRanges;
+    if (Array.isArray(ranges) && ranges.length) {
+      header.textContent = ranges
+        .filter((range) => Array.isArray(range) && range.length >= 2)
+        .map(([start, end]) => `${dateText(start)} – ${dateText(end)}`)
+        .join(" vs ");
+    }
+    return;
+  }
+
+  const dateRange = state.dashboard?.dateRange || state.options?.dateRange;
+  header.textContent = dateRange
+    ? `${dateText(dateRange.start)} – ${dateText(dateRange.end)}`
+    : "No reporting data";
 }
 
 function setComparisonView(view) {
