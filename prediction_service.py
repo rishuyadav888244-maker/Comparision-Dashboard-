@@ -48,7 +48,7 @@ _METRICS = [
     ("services", "OPD services (excl. consultation)", "count", True),
     ("ipd_revenue", "IPD revenue", "currency", True),
     ("opd_revenue", "OPD revenue", "currency", True),
-    ("credit_due", "Credit due (pending)", "currency", False),
+    ("credit_due", "Credit due", "currency", False),
 ]
 
 
@@ -75,18 +75,19 @@ def _events(frame):
     admission, discharge, opd = (
         types.eq("admission"), types.eq("discharge"), types.eq("opd")
     )
-    type_column = "Service Type" if "Service Type" in frame else "Service Name"
-    if type_column in frame:
-        kind = frame[type_column].fillna("").astype(str).str.strip().str.casefold()
-        consultation = opd & kind.eq("consultation")
-        service = opd & kind.ne("") & kind.ne("consultation")
-    else:
-        consultation = service = pd.Series(False, index=frame.index)
-    name_column = "Service Name" if "Service Name" in frame else type_column
-    names = (
-        frame[name_column].fillna("").astype(str).str.strip()
-        if name_column in frame else blank
+    name_column = next(
+        (column for column in ("Service Name", "Service Type") if column in frame),
+        None,
     )
+    names = frame[name_column].fillna("").astype(str).str.strip() if name_column else blank
+    type_column = "Service Type" if "Service Type" in frame else name_column
+    kinds = (
+        frame[type_column].fillna("").astype(str).str.strip().str.casefold()
+        if type_column else blank
+    )
+    consultation = opd & kinds.eq("consultation")
+    service_indexes = set(backend.opd_service_records(frame).index)
+    service = pd.Series(frame.index.isin(service_indexes), index=frame.index)
     amount = number("Service Final Amount")
 
     def label(column):
@@ -350,6 +351,7 @@ _BREAKDOWN_METRICS = [
     ("discharges", "IPD discharges", "count"),
     ("admissions", "IPD admissions", "count"),
     ("opd", "OPD consultations", "count"),
+    ("services", "OPD Services", "count"),
 ]
 _BREAKDOWN_DIMENSIONS = [("departments", "department"), ("doctors", "doctor"), ("panels", "panel")]
 
@@ -569,7 +571,7 @@ def get_prediction(query):
     if mode == "Period" and period not in _PERIOD_BOUNDS:
         raise ValueError("Choose a billing period to predict.")
     try:
-        horizon = int(filters.get("horizon", 6))
+        horizon = int(filters.get("horizon", 12))
         window = int(filters.get("window", 3)) if mode == "Recent" else 0
     except (TypeError, ValueError) as error:
         raise ValueError("Forecast length and look-back must be numbers.") from error

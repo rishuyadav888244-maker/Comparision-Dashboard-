@@ -73,6 +73,37 @@ class WebDashboardServiceTests(unittest.TestCase):
 
         self.assertEqual(consultations["UHID"].tolist(), ["U1"])
 
+    def test_opd_service_records_use_type_and_service_name_only(self):
+        frame = pd.DataFrame([
+            {
+                "Type": " opd ", "Service Name": " CBC ",
+                "Service Type": "Laboratory", "UHID": "OPD-SERVICE",
+            },
+            {
+                "Type": "OPD", "Service Name": " Consultation ",
+                "Service Type": "Laboratory", "UHID": "OPD-CONSULTATION",
+            },
+            {
+                "Type": "OPD", "Service Name": "Ultrasound",
+                "Service Type": "Consultation", "UHID": "OPD-NONCONSULT-TYPE",
+            },
+            {
+                "Type": "Discharge", "Service Name": "CBC",
+                "Service Type": "Laboratory", "UHID": "IPD-SERVICE",
+            },
+            {
+                "Type": "OPD", "Service Name": "",
+                "Service Type": "Laboratory", "UHID": "OPD-NO-NAME",
+            },
+        ])
+
+        services = backend.opd_service_records(frame)
+
+        self.assertEqual(
+            services["UHID"].tolist(),
+            ["OPD-SERVICE", "OPD-NONCONSULT-TYPE"],
+        )
+
     def test_dashboard_uses_existing_kpi_and_filter_calculations(self):
         datasets = database.list_saved_datasets()
         result = dashboard_service.get_dashboard({
@@ -91,6 +122,9 @@ class WebDashboardServiceTests(unittest.TestCase):
         self.assertEqual(result["kpis"]["credit_due"], 100)
         self.assertEqual(result["kpis"]["discharges"], 1)
         self.assertEqual(result["kpis"]["bed_days"], 3)
+        self.assertEqual(result["kpis"]["arpp"], 1000)
+        self.assertAlmostEqual(result["kpis"]["per_day_patient_charge"], 1000 / 3)
+        self.assertEqual(result["kpis"]["per_day_revenue"], 625)
         self.assertEqual(result["kpis"]["admissions"], 0)
         self.assertEqual(result["kpis"]["opd_consultation"], 1)
         self.assertEqual(result["recordCount"], 2)
@@ -137,6 +171,66 @@ class WebDashboardServiceTests(unittest.TestCase):
                 "OPD discount / concession",
             ],
         )
+
+    def test_dashboard_selected_days_respect_month_period_and_calendar_boundaries(self):
+        frame = pd.DataFrame([
+            {"Type": "Discharge", "DOD": "2024-01-08"},
+            {"Type": "OPD", "DOA": "2024-02-25"},
+            {"Type": "Discharge", "DOD": "2024-03-05"},
+        ])
+
+        self.assertEqual(dashboard_service._dashboard_selected_days(frame), 58)
+        self.assertEqual(
+            dashboard_service._dashboard_selected_days(
+                frame, ["January", "March"], ["1-10 Days"]
+            ),
+            8,
+        )
+
+    def test_dashboard_chart_groups_keep_all_categories_and_full_names(self):
+        frame = pd.DataFrame([
+            {"Department": f"Department {index:02d} with a full name", "Revenue": index}
+            for index in range(1, 13)
+        ])
+
+        groups = dashboard_service._group_top(frame, "Department", "Revenue")
+
+        self.assertEqual(len(groups), 12)
+        self.assertEqual(groups[0]["label"], "Department 12 with a full name")
+        self.assertEqual(
+            sum(row["value"] for row in groups),
+            frame["Revenue"].sum(),
+        )
+
+    def test_dashboard_opd_gross_and_discount_kpis_use_filtered_opd_rows(self):
+        rows = pd.DataFrame([
+            {
+                "Type": "Discharge", "DOA": "01/01/2025", "DOD": "02/01/2025",
+                "Service Gross Amt": 99999, "Service Final Amount": 90000,
+                "Dept. Name": "Medicine", "Doctor Name": "Dr A",
+                "Panel Name": "Panel A", "Credit Due": 0,
+            },
+            {
+                "Type": "OPD", "DOA": "03/01/2025",
+                "Service Gross Amt": 500, "Service Final Amount": 400,
+            },
+            {
+                "Type": "OPD", "DOA": "04/01/2025",
+                "Service Gross Amt": 300, "Service Final Amount": 200,
+            },
+        ])
+        dataset_id = database.save_hospital_data(
+            rows, "Surya Hospital", "opd-kpi-test.xlsx", b"opd-kpi-test"
+        )["dataset_id"]
+
+        result = dashboard_service.get_dashboard({
+            "datasetId": dataset_id,
+            "month": ["January"],
+            "period": ["1-10 Days"],
+        })
+
+        self.assertEqual(result["kpis"]["opd_gross_amount"], 800)
+        self.assertEqual(result["kpis"]["opd_discount"], 200)
 
     def test_overview_target_chart_scales_with_year_month_and_period_filters(self):
         monthly_target = backend.monthly_revenue_target("Surya Hospital")
@@ -200,6 +294,7 @@ class WebDashboardServiceTests(unittest.TestCase):
         self.assertIn("window.__PREDICTION_REPORT_DATA__ = data", text)
         self.assertIn('url.pathname.replace(/^\\/[A-Za-z]:/, "")', text)
         self.assertIn('id="print-context"', text)
+        self.assertIn('src="data:image/png;base64,', text)
         self.assertIn('window.addEventListener("beforeprint", updatePrintContext)', text)
         self.assertIn(".comparison-controls .comparison-filter-grid", text)
         self.assertIn(
@@ -221,9 +316,9 @@ class WebDashboardServiceTests(unittest.TestCase):
         self.assertEqual(len(bundle["rows"]), 4)
         self.assertEqual(len(bundle["rows"][0]), 15)
         self.assertNotIn("U1", json.dumps(bundle))
-        self.assertEqual(len(bundle["predictions"]), 96)
-        self.assertIn('["All Hospitals","Year","","","6"]', bundle["predictions"])
-        self.assertEqual(get_prediction.call_count, 32)
+        self.assertEqual(len(bundle["predictions"]), 6)
+        self.assertIn('["Surya Hospital","12"]', bundle["predictions"])
+        self.assertEqual(get_prediction.call_count, 1)
 
     def test_offline_prediction_horizon_variants_match_live_predictions(self):
         import prediction_service
@@ -259,6 +354,52 @@ class WebDashboardServiceTests(unittest.TestCase):
                     actual_short,
                 )
 
+    def test_prediction_uses_selected_hospital_and_supports_one_year_horizon(self):
+        import prediction_service
+
+        other_hospital = pd.DataFrame([{
+            "DOA": "05/01/2024", "DOD": "08/01/2024", "Month": "January",
+            "Dept. Name": "Other Hospital", "Doctor Name": "Dr Other",
+            "Panel Name": "Other Panel", "Type": "Discharge",
+            "Service Type": "Consultation", "Service Name": "Consultation",
+            "Service Final Amount": 999999, "Cash Due": 0, "Credit Due": 0,
+            "Bed Days": 1, "UHID": "OTHER",
+        }])
+        database.save_hospital_data(
+            other_hospital, "NIMMS Hospital", "nimms-2024.xlsx", b"nimms-2024"
+        )
+
+        result = prediction_service.get_prediction({
+            "hospital": "Surya Hospital",
+            "filters": {"horizon": "12"},
+        })
+
+        self.assertTrue(result["hasData"])
+        self.assertEqual(result["hospital"], "Surya Hospital")
+        self.assertEqual(result["horizon"], 12)
+        self.assertEqual(result["unit"], "months")
+        self.assertEqual(result["dataRange"], ["2025-01-08", "2026-01-09"])
+        revenue = next(metric for metric in result["metrics"] if metric["key"] == "revenue")
+        self.assertEqual(sum(row["forecast"] is not None for row in revenue["rows"]), 12)
+        for dimension, expected_name in (
+            ("departments", "Surgery"),
+            ("doctors", "Dr B"),
+            ("panels", "Panel B"),
+        ):
+            services = result["breakdown"][dimension]["services"]
+            self.assertEqual([row["name"] for row in services], [expected_name])
+            self.assertEqual(services[0]["previous"], 1)
+            self.assertEqual(
+                sum(row["previous"] for row in services),
+                len(backend.opd_service_records(self.rows_2026)),
+            )
+        with self.assertRaisesRegex(ValueError, "between 1 and 12"):
+            prediction_service.get_prediction({
+                "hospital": "Surya Hospital",
+                "filters": {"horizon": "24"},
+            })
+        self.assertNotIn(999999, [row["actual"] for row in revenue["rows"]])
+
     def test_revenue_insights_match_dashboard_summary_fields(self):
         rows = pd.DataFrame([
             {
@@ -292,6 +433,45 @@ class WebDashboardServiceTests(unittest.TestCase):
         self.assertEqual(
             insights_by_label["OPD discount / concession"], "₹100 (20% of gross)"
         )
+
+    def test_revenue_insights_read_gross_amount_aliases(self):
+        for gross_column in ("Service Gross Amt", "Service Gross Amount"):
+            with self.subTest(gross_column=gross_column):
+                rows = pd.DataFrame([
+                    {
+                        "Type": "Discharge", "DOA": "01/01/2025",
+                        "DOD": "02/01/2025", "Doctor Name": "Dr A",
+                        "Dept. Name": "Medicine", "Panel Name": "Panel A",
+                        gross_column: 1200, "Service Final Amount": 1000,
+                        "Credit Due": 200,
+                    },
+                    {
+                        "Type": "OPD", "DOA": "03/01/2025",
+                        gross_column: 500, "Service Final Amount": 400,
+                    },
+                    {
+                        "Type": "OPD", "DOA": "04/01/2025",
+                        gross_column: 300, "Service Final Amount": 200,
+                    },
+                ])
+                insights_by_label = {
+                    item["label"]: item["value"]
+                    for item in backend.insights(rows)["items"]
+                }
+
+                self.assertEqual(
+                    insights_by_label["Payment still pending"],
+                    "₹200 (17% of IPD billing)",
+                )
+                self.assertEqual(insights_by_label["OPD gross amount"], "₹800")
+                self.assertEqual(
+                    insights_by_label["OPD final amount (received)"],
+                    "₹600 (75% of gross)",
+                )
+                self.assertEqual(
+                    insights_by_label["OPD discount / concession"],
+                    "₹200 (25% of gross)",
+                )
 
     def test_comparison_returns_period_kpis_and_department_rows(self):
         result = dashboard_service.get_comparison({

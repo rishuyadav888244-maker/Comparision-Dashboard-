@@ -419,9 +419,13 @@ def calculate_dashboard_metrics(filtered_df, hospital):
         total_beds = 205
     else:
         total_beds = TOTAL_BEDS
-    return calculate_kpis(
+    kpis = calculate_kpis(
         filtered_df, total_beds, monthly_revenue_target(hospital)
     )
+    opd_gross, opd_discount = opd_gross_and_discount(filtered_df)
+    kpis["opd_gross_amount"] = opd_gross
+    kpis["opd_discount"] = opd_discount
+    return kpis
 
 
 def period_revenue(df, month=None, period=None):
@@ -726,15 +730,21 @@ def opd_uhid_breakdown(df):
     return {"daily": daily, "doctor": doctor, "total": total}
 
 
-def opd_services_breakdown(df):
-    columns = ["Service Name", "Count"]
+def opd_service_records(df):
+    """Return non-consultation OPD service records used by dashboard reports."""
     if "Type" not in df.columns or "Service Name" not in df.columns:
-        return pd.DataFrame(columns=columns)
+        return df.iloc[0:0].copy()
 
     opd = df[df["Type"].astype(str).str.strip().str.casefold() == "opd"].copy()
     opd["Service Name"] = opd["Service Name"].fillna("").astype(str).str.strip()
     service_names = opd["Service Name"].str.casefold()
     opd = opd[(opd["Service Name"] != "") & (service_names != "consultation")]
+    return opd
+
+
+def opd_services_breakdown(df):
+    columns = ["Service Name", "Count"]
+    opd = opd_service_records(df)
     if opd.empty:
         return pd.DataFrame(columns=columns)
 
@@ -861,6 +871,35 @@ def _insight_money(value):
     return f"₹{amount:,.0f}"
 
 
+def _service_gross_amounts(rows):
+    columns = (
+        "Service Gross Amt",
+        "Service Gross Amount",
+        "Service Amount",
+        "Gross Amount",
+        "Gross Amt",
+    )
+    for column in columns:
+        if column not in rows.columns:
+            continue
+        amounts = pd.to_numeric(rows[column], errors="coerce")
+        if amounts.sum() > 0:
+            return amounts.fillna(0)
+    return None
+
+
+def opd_gross_and_discount(df):
+    if "Type" not in df.columns:
+        return None, None
+    opd_mask = df["Type"].astype(str).str.strip().str.casefold().eq("opd")
+    opd = df.loc[opd_mask]
+    gross_amounts = _service_gross_amounts(opd)
+    if gross_amounts is None:
+        return None, None
+    final_amounts = service_final_amounts(opd)
+    return float(gross_amounts.sum()), float((gross_amounts - final_amounts).sum())
+
+
 def insights(df, monthly_target=DEFAULT_TARGET):
     empty = {
         "department": "—",
@@ -928,18 +967,12 @@ def insights(df, monthly_target=DEFAULT_TARGET):
             f"({share(amount, ipd_total):.0f}% of IPD revenue)"
         )
 
-    gross_total = (
-        pd.to_numeric(opd["Service Amount"], errors="coerce").fillna(0).sum()
-        if "Service Amount" in opd.columns else 0
-    )
-    gross_available = "Service Amount" in opd.columns and gross_total > 0
-    opd_gross = float(gross_total) if gross_available else None
-    discount = max(0.0, float(opd_gross) - opd_total) if gross_available else None
+    opd_gross, discount = opd_gross_and_discount(opd)
+    gross_available = opd_gross is not None
+    ipd_gross_amounts = _service_gross_amounts(ipd)
     ipd_billing = (
-        pd.to_numeric(ipd["Service Amount"], errors="coerce").fillna(0).sum()
-        if "Service Amount" in ipd.columns
-        and pd.to_numeric(ipd["Service Amount"], errors="coerce").fillna(0).sum() > 0
-        else ipd_total
+        float(ipd_gross_amounts.sum())
+        if ipd_gross_amounts is not None else ipd_total
     )
     pending = (
         pd.to_numeric(ipd["Credit Due"], errors="coerce").fillna(0).sum()

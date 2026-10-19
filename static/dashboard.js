@@ -16,6 +16,8 @@ const MONTH_NAMES = [
   "July", "August", "September", "October", "November", "December",
 ];
 const COMPARISON_SERIES_KEYS = ["first", "second", "third"];
+const DASHBOARD_CATEGORY_MAX_ROWS = 15;
+const DASHBOARD_CATEGORY_ROW_HEIGHT = 28;
 const $ = (selector) => document.querySelector(selector);
 const state = {
   options: null,
@@ -90,6 +92,86 @@ function addOptions(select, values, { placeholder = null, selected = null } = {}
       : selected !== null && selected === option.value;
     select.append(option);
   });
+  if (select.multiple) renderMultiSelect(select);
+}
+
+function multiSelectWidget(select) {
+  return $(`#${select.id.replace("-select", "-filter-widget")}`);
+}
+
+function renderMultiSelect(select) {
+  const widget = multiSelectWidget(select);
+  const optionsContainer = widget.querySelector(".multi-select-options");
+  optionsContainer.replaceChildren();
+  [...select.options].filter((option) => option.value).forEach((option, index) => {
+    const label = document.createElement("label");
+    label.className = "multi-select-option";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = option.value;
+    checkbox.checked = option.selected;
+    checkbox.id = `${select.id}-option-${index}`;
+    const text = document.createElement("span");
+    text.textContent = option.textContent;
+    label.append(checkbox, text);
+    optionsContainer.append(label);
+  });
+  updateMultiSelect(select);
+}
+
+function updateMultiSelect(select) {
+  const widget = multiSelectWidget(select);
+  const selected = new Set(selectedValues(select));
+  widget.querySelectorAll(".multi-select-option input").forEach((checkbox) => {
+    checkbox.checked = selected.has(checkbox.value);
+  });
+  const count = selected.size;
+  widget.querySelector(`#${select.id.replace("-select", "")}-filter-count`).textContent =
+    `${count} selected`;
+  const selectAllButton = widget.querySelector('[data-multiselect-action="toggle-all"]');
+  selectAllButton.textContent = count === select.options.length && count > 0
+    ? "Unselect all"
+    : "Select all";
+}
+
+function bindMultiSelect(selectId) {
+  const select = $(`#${selectId}`);
+  const widget = multiSelectWidget(select);
+  const trigger = widget.querySelector(".multi-select-trigger");
+  const menu = widget.querySelector(".multi-select-menu");
+
+  trigger.addEventListener("click", () => {
+    const opening = menu.hidden;
+    document.querySelectorAll(".multi-select-menu").forEach((otherMenu) => {
+      otherMenu.hidden = true;
+      otherMenu.previousElementSibling.setAttribute("aria-expanded", "false");
+    });
+    menu.hidden = !opening;
+    trigger.setAttribute("aria-expanded", String(opening));
+  });
+
+  widget.addEventListener("change", (event) => {
+    const checkbox = event.target.closest(".multi-select-option input");
+    if (!checkbox) return;
+    const option = [...select.options].find((item) => item.value === checkbox.value);
+    if (option) option.selected = checkbox.checked;
+    updateMultiSelect(select);
+  });
+
+  widget.querySelector('[data-multiselect-action="toggle-all"]').addEventListener("click", () => {
+    const selectAll = selectedValues(select).length !== select.options.length;
+    [...select.options].forEach((option) => {
+      option.selected = selectAll && Boolean(option.value);
+    });
+    updateMultiSelect(select);
+  });
+
+  widget.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || menu.hidden) return;
+    menu.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.focus();
+  });
 }
 
 function selectedValues(select) {
@@ -145,9 +227,6 @@ function updatePrintContext() {
       : $("#dataset-select")?.selectedOptions[0]?.textContent);
     addLine("Month filter", dashboard?.filters?.month?.join(", ") || "All months");
     addLine("Period filter", dashboard?.filters?.period?.join(", ") || "All periods");
-    addLine("Records shown", dashboard
-      ? number(dashboard.recordCount)
-      : $("#record-count")?.textContent);
   } else {
     const mode = $("#comparison-view-mode")?.value;
     if (mode === "prediction") {
@@ -215,6 +294,8 @@ async function initialize() {
     })), { selected: options.defaultDatasetId });
     addOptions($("#month-select"), options.months || []);
     addOptions($("#period-select"), options.periods || PERIODS);
+    bindMultiSelect("month-select");
+    bindMultiSelect("period-select");
     addOptions($("#comparison-hospital"), ["All Hospitals", ...(options.hospitals || [])], {
       selected: "All Hospitals",
     });
@@ -248,7 +329,17 @@ function bindEvents() {
   $("#clear-filters").addEventListener("click", () => {
     $("#month-select").selectedIndex = -1;
     $("#period-select").selectedIndex = -1;
+    updateMultiSelect($("#month-select"));
+    updateMultiSelect($("#period-select"));
     loadDashboard();
+  });
+  document.addEventListener("click", (event) => {
+    document.querySelectorAll(".multi-select").forEach((widget) => {
+      if (widget.contains(event.target)) return;
+      const menu = widget.querySelector(".multi-select-menu");
+      menu.hidden = true;
+      widget.querySelector(".multi-select-trigger").setAttribute("aria-expanded", "false");
+    });
   });
   $("#refresh-data").addEventListener("click", () => refreshOptions($("#dataset-select").value));
   $("#export-button").addEventListener("click", exportCsv);
@@ -351,7 +442,6 @@ async function loadDashboard() {
 function renderNoData() {
   $("#kpi-grid").replaceChildren();
   $("#date-range").textContent = "No saved hospital data";
-  $("#record-count").textContent = "Upload a workbook to begin.";
 }
 
 function renderDashboard(data) {
@@ -362,8 +452,6 @@ function renderDashboard(data) {
   const start = data.dateRange.start;
   const end = data.dateRange.end;
   $("#date-range").textContent = `${dateText(start)} – ${dateText(end)}`;
-  $("#last-updated").textContent = `Dataset updated ${dateText(data.dataset.upload_date)}`;
-  $("#record-count").textContent = `${number(data.recordCount)} records in this view`;
   renderKpis(data.kpis);
   renderInsights(data.charts.insights, data.charts, data.kpis);
   drawDashboardCharts(data.charts);
@@ -377,22 +465,22 @@ function renderKpis(kpis = {}) {
   const showMoney = (value) =>
     typeof value === "number" && Number.isFinite(value) ? money(value) : "—";
   const descriptors = [
-    ["Total revenue", showMoney(kpis.revenue), "IPD and OPD revenue", COLORS.teal],
-    ["IPD revenue", showMoney(kpis.ipd_revenue), "Discharge services", COLORS.blue],
-    ["OPD revenue", showMoney(kpis.opd_revenue), "Outpatient services", COLORS.orange],
-    ["Target achievement", `${showNumber(kpis.achievement, { maximumFractionDigits: 1 })}${typeof kpis.achievement === "number" && Number.isFinite(kpis.achievement) ? "%" : ""}`, "Of revenue target", COLORS.teal],
-    ["OPD consultations", showNumber(kpis.opd_consultation, { maximumFractionDigits: 0 }), "Consultation services", COLORS.blue],
-    ["Admissions", showNumber(kpis.admissions, { maximumFractionDigits: 0 }), "Patient admissions", COLORS.orange],
-    ["Discharges", showNumber(kpis.discharges, { maximumFractionDigits: 0 }), "Patient discharges", COLORS.blue],
-    ["Occupancy", `${showNumber(kpis.occupancy, { maximumFractionDigits: 1 })}${typeof kpis.occupancy === "number" && Number.isFinite(kpis.occupancy) ? "%" : ""}`, "Bed occupancy rate", COLORS.teal],
-    ["Occupied bed days", showNumber(kpis.bed_days, { maximumFractionDigits: 0 }), "Discharge records", COLORS.orange],
-    ["Average length of stay", `${showNumber(kpis.alos, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${typeof kpis.alos === "number" && Number.isFinite(kpis.alos) ? " days" : ""}`, "Per discharge", COLORS.blue],
-    ["Cash due", showMoney(kpis.cash_due), "Discharge records", COLORS.teal],
-    ["Credit due", showMoney(kpis.credit_due), "Discharge records", COLORS.orange],
+    ["Admissions", showNumber(kpis.admissions, { maximumFractionDigits: 0 }), COLORS.teal],
+    ["Discharges", showNumber(kpis.discharges, { maximumFractionDigits: 0 }), COLORS.teal],
+    ["OPD consultations", showNumber(kpis.opd_consultation, { maximumFractionDigits: 0 }), COLORS.teal],
+    ["Total revenue", showMoney(kpis.revenue), COLORS.teal],
+    ["IPD revenue", showMoney(kpis.ipd_revenue), COLORS.teal],
+    ["OPD revenue", showMoney(kpis.opd_revenue), COLORS.teal],
+    ["Cash due", showMoney(kpis.cash_due), COLORS.teal],
+    ["Credit due", showMoney(kpis.credit_due), COLORS.teal],
+    ["Average length of stay", `${showNumber(kpis.alos, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${typeof kpis.alos === "number" && Number.isFinite(kpis.alos) ? " days" : ""}`, COLORS.teal],
+    ["ARPP", showMoney(kpis.arpp), COLORS.teal],
+    ["Per day per patient charge", showMoney(kpis.per_day_patient_charge), COLORS.teal],
+    ["Per day revenue", showMoney(kpis.per_day_revenue), COLORS.teal],
   ];
   const grid = $("#kpi-grid");
   grid.replaceChildren();
-  descriptors.forEach(([label, value, subtitle, accent]) => {
+  descriptors.forEach(([label, value, accent]) => {
     const card = document.createElement("article");
     card.className = "kpi-card";
     card.style.setProperty("--accent", accent);
@@ -402,10 +490,7 @@ function renderKpis(kpis = {}) {
     const valueElement = document.createElement("div");
     valueElement.className = "kpi-value";
     valueElement.textContent = value;
-    const detail = document.createElement("div");
-    detail.className = "kpi-sub";
-    detail.textContent = subtitle;
-    card.append(title, valueElement, detail);
+    card.append(title, valueElement);
     grid.append(card);
   });
 }
@@ -475,9 +560,9 @@ function legacyInsightItems(insights, charts, kpis) {
       label: "Payment still pending",
       value: `${money(pending)}${panelBilling ? ` (${insightShare(pending, panelBilling)} of IPD billing)` : ""}`,
     },
-    { icon: "🧾", label: "OPD gross amount", value: "Unavailable — refresh dashboard data" },
+    { icon: "🧾", label: "OPD gross amount", value: money(kpis.opd_gross_amount) },
     { icon: "✅", label: "OPD final amount (received)", value: money(opdRevenue) },
-    { icon: "🏷️", label: "OPD discount / concession", value: "Unavailable — refresh dashboard data" },
+    { icon: "🏷️", label: "OPD discount / concession", value: money(kpis.opd_discount) },
   ];
 }
 
@@ -525,62 +610,125 @@ function appendCell(row, text, className = "") {
 
 function drawDashboardCharts(charts) {
   const totals = charts.totals || {};
+  const horizontalCharts = [
+    {
+      canvas: $("#department-chart"),
+      rows: compactDashboardChartRows(charts.dischargeDepartments),
+      options: { color: COLORS.teal, horizontal: true, total: totals.dischargeDepartments },
+    },
+    {
+      canvas: $("#discharge-doctor-chart"),
+      rows: compactDashboardChartRows(charts.dischargeDoctors),
+      options: { color: COLORS.teal, horizontal: true, total: totals.dischargeDoctors },
+    },
+    {
+      canvas: $("#ipd-department-chart"),
+      rows: compactDashboardChartRows(charts.ipdRevenueDepartments),
+      options: {
+        color: COLORS.teal, horizontal: true, formatter: compactMoney,
+        total: totals.ipdRevenueDepartments,
+      },
+    },
+    {
+      canvas: $("#ipd-doctor-chart"),
+      rows: compactDashboardChartRows(charts.ipdRevenueDoctors),
+      options: {
+        color: COLORS.teal, horizontal: true, formatter: compactMoney,
+        total: totals.ipdRevenueDoctors,
+      },
+    },
+    {
+      canvas: $("#admission-department-chart"),
+      rows: compactDashboardChartRows(charts.admissionDepartments),
+      options: { color: COLORS.teal, horizontal: true, total: totals.admissionDepartments },
+    },
+    {
+      canvas: $("#admission-doctor-chart"),
+      rows: compactDashboardChartRows(charts.admissionDoctors),
+      options: { color: COLORS.teal, horizontal: true, total: totals.admissionDoctors },
+    },
+    {
+      canvas: $("#opd-doctor-chart"),
+      rows: compactDashboardChartRows(charts.opdDoctors),
+      options: { color: COLORS.teal, horizontal: true, total: totals.opdDoctors },
+    },
+    {
+      canvas: $("#services-chart"),
+      rows: compactDashboardChartRows(charts.opdServices),
+      options: { color: COLORS.teal, horizontal: true, total: totals.opdServices },
+    },
+  ];
+  const sharedChartHeight = Math.max(
+    18 + DASHBOARD_CATEGORY_MAX_ROWS * DASHBOARD_CATEGORY_ROW_HEIGHT,
+    ...horizontalCharts.map(({ canvas, rows, options }) =>
+      horizontalBarLayout(canvas, rows, options).height),
+  );
+  horizontalCharts.forEach(({ canvas, rows, options }) => {
+    drawBars(canvas, rows, { ...options, layoutHeight: sharedChartHeight });
+  });
+  const showFilteredDailyValues = (canvas, rows) =>
+    Boolean(state.dashboard?.filters?.month?.length)
+    && charts.granularity !== "monthly"
+    && rows?.length > 0
+    && canvas.clientWidth / rows.length >= 18;
+  const showAllRevenueValues = charts.granularity === "monthly"
+    || showFilteredDailyValues($("#revenue-chart"), charts.revenueTrend);
   drawBars($("#revenue-chart"), charts.revenueTrend, {
     color: COLORS.teal, formatter: compactMoney, mode: "line",
-    showAllValueLabels: charts.granularity === "monthly",
+    showAllValueLabels: showAllRevenueValues,
+    showPercentLabels: !showAllRevenueValues || charts.granularity === "monthly",
     total: totals.revenueTrend,
   });
+  const showAllFlowValues = charts.granularity === "monthly"
+    || showFilteredDailyValues($("#flow-chart"), charts.patientFlow);
   drawGroupedBars($("#flow-chart"), charts.patientFlow, [
     { key: "Admissions", label: "Admissions", color: COLORS.teal },
     { key: "Discharges", label: "Discharges", color: COLORS.blue },
   ], totals.patientFlow, {
-    showAllValueLabels: charts.granularity === "monthly",
+    showAllValueLabels: showAllFlowValues,
     showPercent: false,
   });
-  drawBars($("#department-chart"), charts.dischargeDepartments, {
-    color: COLORS.blue, horizontal: true, total: totals.dischargeDepartments,
-  });
-  drawBars($("#discharge-doctor-chart"), charts.dischargeDoctors, {
-    color: COLORS.blue, horizontal: true, total: totals.dischargeDoctors,
-  });
-  drawBars($("#ipd-department-chart"), charts.ipdRevenueDepartments, {
-    color: COLORS.teal, horizontal: true, formatter: compactMoney,
-    total: totals.ipdRevenueDepartments,
-  });
-  drawBars($("#ipd-doctor-chart"), charts.ipdRevenueDoctors, {
-    color: COLORS.teal, horizontal: true, formatter: compactMoney,
-    total: totals.ipdRevenueDoctors,
-  });
-  drawBars($("#admission-department-chart"), charts.admissionDepartments, {
-    color: COLORS.orange, horizontal: true, total: totals.admissionDepartments,
-  });
-  drawBars($("#admission-doctor-chart"), charts.admissionDoctors, {
-    color: COLORS.orange, horizontal: true, total: totals.admissionDoctors,
-  });
-  drawBars($("#opd-doctor-chart"), charts.opdDoctors, {
-    color: COLORS.blue, horizontal: true, total: totals.opdDoctors,
-  });
-  drawBars($("#services-chart"), charts.opdServices, {
-    color: COLORS.orange, horizontal: true, total: totals.opdServices,
-  });
+  const showAllOpdValues = charts.granularity === "monthly"
+    || showFilteredDailyValues($("#opd-trend-chart"), charts.opdDaily);
   drawBars($("#opd-trend-chart"), charts.opdDaily, {
-    color: COLORS.blue, mode: "line",
-    showAllValueLabels: charts.granularity === "monthly",
+    color: COLORS.teal, mode: "line",
+    showAllValueLabels: showAllOpdValues,
+    showPercentLabels: !showAllOpdValues || charts.granularity === "monthly",
     total: totals.opdDaily,
   });
-  drawGroupedBars($("#target-chart"), charts.targetProgress, [
-    {
-      key: "actual", label: "Actual revenue", color: COLORS.teal,
-      formatter: compactMoney,
-      percentage: (row) => percent(row.actual, row.target),
-    },
-    {
-      key: "target", label: "Revenue target", color: "#cad6df",
-      formatter: compactMoney,
-      percentage: (row) => Number(row.target) > 0 ? 100 : 0,
-    },
-  ], totals.targetProgress, { showPercent: false });
+  drawTargetProgress(totals.targetProgress);
   drawPanelPerformanceChart(charts.panels);
+}
+
+function compactDashboardChartRows(rows) {
+  const categories = Array.isArray(rows) ? rows : [];
+  if (categories.length <= DASHBOARD_CATEGORY_MAX_ROWS) return categories;
+
+  const visible = categories.slice(0, DASHBOARD_CATEGORY_MAX_ROWS - 1);
+  const hidden = categories.slice(DASHBOARD_CATEGORY_MAX_ROWS - 1);
+  visible.push({
+    label: "Others",
+    value: hidden.reduce((total, row) => total + Number(row.value || 0), 0),
+  });
+  return visible;
+}
+
+function drawTargetProgress(totals = {}) {
+  const actual = Number(totals.actual || 0);
+  const target = Number(totals.target || 0);
+  const achievement = target > 0 ? actual / target * 100 : 0;
+  const progress = Math.min(100, Math.max(0, achievement));
+  const ring = $("#target-progress-ring");
+  const circumference = 2 * Math.PI * 86;
+
+  $("#target-progress-target").textContent = compactMoney(target);
+  $("#target-progress-actual").textContent = compactMoney(actual);
+  $("#target-progress-value").textContent = `${achievement.toFixed(1)}%`;
+  $("#target-progress-arc").setAttribute(
+    "stroke-dasharray", `${circumference * progress / 100} ${circumference}`,
+  );
+  ring.setAttribute("aria-valuenow", String(progress));
+  ring.setAttribute("aria-valuetext", `${achievement.toFixed(1)}% of target`);
 }
 
 function drawPanelPerformanceChart(panels) {
@@ -707,6 +855,12 @@ function chartLabelPlan(rows, chartWidth) {
 }
 
 function drawBars(canvas, rows, options = {}) {
+  const horizontalLayout = options.horizontal
+    ? horizontalBarLayout(canvas, rows || [], options)
+    : null;
+  if (horizontalLayout) {
+    canvas.parentElement.style.height = `${horizontalLayout.height}px`;
+  }
   const { context: ctx, width, height } = setupCanvas(canvas);
   ctx.clearRect(0, 0, width, height);
   if (!rows || !rows.length || width < 30 || height < 40) {
@@ -720,7 +874,7 @@ function drawBars(canvas, rows, options = {}) {
     return;
   }
   if (options.horizontal) {
-    drawHorizontalBars(canvas, ctx, width, height, rows, options);
+    drawHorizontalBars(canvas, ctx, width, height, rows, options, horizontalLayout);
     renderChartTotal(canvas.parentElement, [{
       label: "Grand total",
       value: options.total?.value ?? rows.reduce((sum, row) => sum + Number(row.value || 0), 0),
@@ -771,14 +925,24 @@ function drawBars(canvas, rows, options = {}) {
       ctx.beginPath(); ctx.arc(centerX, y, 3.2, 0, Math.PI * 2); ctx.fill();
       if (index % valueInterval === 0) {
         const previousValue = index > 0 ? Number(rows[index - 1].value || 0) : value;
-        drawValueAndPercent(
-          ctx,
-          (options.formatter || number)(value),
-          percentLabel(percent(value, chartTotal)),
-          centerX,
-          y - 9,
-          changeColor(value, previousValue),
-        );
+        if (options.showPercentLabels === false) {
+          drawValueLabel(
+            ctx,
+            (options.formatter || number)(value),
+            centerX,
+            y - 7 - (index % 2) * 12,
+            changeColor(value, previousValue),
+          );
+        } else {
+          drawValueAndPercent(
+            ctx,
+            (options.formatter || number)(value),
+            percentLabel(percent(value, chartTotal)),
+            centerX,
+            y - 9,
+            changeColor(value, previousValue),
+          );
+        }
       }
       hitboxes.push({
         x: centerX - 9, y: y - 9, width: 18, height: 18,
@@ -805,7 +969,7 @@ function drawBars(canvas, rows, options = {}) {
     }
     ctx.fillStyle = COLORS.muted;
     ctx.textAlign = "center";
-    if (labelPlan.showAxisLabel(index)) {
+    if (options.showAllValueLabels || labelPlan.showAxisLabel(index)) {
       ctx.font = PERIODS.includes(String(row.label || ""))
         ? "bold 10px Segoe UI, Arial"
         : "10px Segoe UI, Arial";
@@ -821,24 +985,94 @@ function drawBars(canvas, rows, options = {}) {
   }]);
 }
 
-function drawHorizontalBars(canvas, ctx, width, height, rows, options) {
-  const list = rows.slice(0, 8);
-  const margin = { top: 8, right: 50, bottom: 10, left: Math.min(132, Math.max(82, width * .33)) };
-  const available = width - margin.left - margin.right;
-  const rowHeight = (height - margin.top - margin.bottom) / list.length;
+function wrapHorizontalLabel(ctx, text, maxWidth) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return [""];
+  const lines = [];
+  let line = "";
+  words.forEach((word) => {
+    let remaining = word;
+    while (remaining) {
+      const candidate = line ? `${line} ${remaining}` : remaining;
+      if (ctx.measureText(candidate).width <= maxWidth) {
+        line = candidate;
+        remaining = "";
+      } else if (line) {
+        lines.push(line);
+        line = "";
+      } else {
+        let splitAt = remaining.length;
+        while (splitAt > 1 && ctx.measureText(remaining.slice(0, splitAt)).width > maxWidth) {
+          splitAt -= 1;
+        }
+        lines.push(remaining.slice(0, splitAt));
+        remaining = remaining.slice(splitAt);
+      }
+    }
+  });
+  if (line) lines.push(line);
+  return lines;
+}
+
+function horizontalBarLayout(canvas, rows, options) {
+  const width = canvas.parentElement.clientWidth;
+  const ctx = canvas.getContext("2d");
+  const formatter = options.formatter || number;
+  ctx.font = "bold 11px Segoe UI, Arial";
+  const valueWidth = Math.max(
+    0,
+    ...rows.map((row) => ctx.measureText(formatter(row.value)).width),
+  );
+  const margin = {
+    top: 8,
+    right: Math.max(58, Math.ceil(valueWidth) + 16),
+    bottom: 10,
+    left: Math.min(190, Math.max(90, width * .34)),
+  };
+  ctx.font = "11px Segoe UI, Arial";
+  const labels = rows.map((row) =>
+    wrapHorizontalLabel(ctx, row.label, Math.max(34, margin.left - 14)),
+  );
+  const rowHeights = labels.map((lines) => Math.max(28, lines.length * 13 + 8));
+  const naturalHeight = Math.max(158, Math.ceil(
+    margin.top + margin.bottom + rowHeights.reduce((sum, item) => sum + item, 0),
+  ));
+  const height = Math.max(naturalHeight, Number(options.layoutHeight) || 0);
+  const extraRowHeight = rowHeights.length
+    ? Math.max(0, height - margin.top - margin.bottom
+      - rowHeights.reduce((sum, item) => sum + item, 0)) / rowHeights.length
+    : 0;
+  return {
+    margin,
+    labels,
+    rowHeights: rowHeights.map((rowHeight) => rowHeight + extraRowHeight),
+    height,
+  };
+}
+
+function drawHorizontalBars(canvas, ctx, width, height, rows, options, layout) {
+  const list = rows;
+  const { margin, labels, rowHeights } = layout;
+  const available = Math.max(16, width - margin.left - margin.right);
   const max = Math.max(...list.map((row) => Number(row.value || 0)), 1);
   const chartTotal = Number(options.total?.value)
     || rows.reduce((sum, row) => sum + Number(row.value || 0), 0);
   const hitboxes = [];
+  let rowTop = margin.top;
   list.forEach((row, index) => {
-    const y = margin.top + index * rowHeight + rowHeight * .23;
+    const rowHeight = rowHeights[index];
     const barHeight = Math.min(17, rowHeight * .54);
+    const y = rowTop + (rowHeight - barHeight) / 2;
     const barWidth = Math.max(2, available * Number(row.value || 0) / max);
     ctx.fillStyle = "#4a5d6e";
     ctx.font = "11px Segoe UI, Arial";
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
-    ctx.fillText(String(row.label || "").slice(0, 20), margin.left - 9, y + barHeight / 2);
+    const labelCenter = rowTop + rowHeight / 2;
+    labels[index].forEach((line, lineIndex) => {
+      const lineOffset = (lineIndex - (labels[index].length - 1) / 2) * 13;
+      ctx.fillText(line, margin.left - 9, labelCenter + lineOffset);
+    });
     ctx.fillStyle = "#f0f4f6";
     roundedRect(ctx, margin.left, y, available, barHeight, 4);
     ctx.fillStyle = options.color || COLORS.teal;
@@ -866,6 +1100,7 @@ function drawHorizontalBars(canvas, ctx, width, height, rows, options) {
         ? {}
         : { percentage: percent(row.value, chartTotal) }),
     });
+    rowTop += rowHeight;
   });
   attachChartTooltip(canvas, hitboxes);
 }
@@ -930,7 +1165,12 @@ function drawGroupedBars(canvas, rows, series, totals = {}, options = {}) {
           : percent(value, seriesTotals[item.key]);
       if (index % valueInterval === 0) {
         if (percentage === null) {
-          drawValueLabel(ctx, (item.formatter || number)(value), x + widthEach / 2, y - 4);
+          drawValueLabel(
+            ctx,
+            (item.formatter || number)(value),
+            x + widthEach / 2,
+            y - 4 - (options.showAllValueLabels ? seriesIndex * 12 : 0),
+          );
         } else {
           drawValueAndPercent(
             ctx,
@@ -951,7 +1191,7 @@ function drawGroupedBars(canvas, rows, series, totals = {}, options = {}) {
     });
     ctx.fillStyle = COLORS.muted;
     ctx.textAlign = "center";
-    if (labelPlan.showAxisLabel(index)) {
+    if (options.showAllValueLabels || labelPlan.showAxisLabel(index)) {
       ctx.font = PERIODS.includes(String(row.label || ""))
         ? "bold 10px Segoe UI, Arial"
         : "10px Segoe UI, Arial";
@@ -1531,28 +1771,11 @@ function renderComparisonMovers(data) {
     }).sort((left, right) =>
       left.change - right.change || left.name.localeCompare(right.name),
     );
-    const netChange = rows.reduce((total, row) => {
-      const values = row.values || [];
-      return total + (Number(values[lastIndex]) || 0) - (Number(values[firstIndex]) || 0);
-    }, 0);
-
-    const metricLabel = {
-      ipdRevenue: "IPD Revenue",
-      ipdDischarges: "IPD Discharges",
-      ipdAdmissions: "IPD Admissions",
-      opdConsultations: "OPD Consultations",
-      opdServices: "OPD Services",
-    }[metric];
     const dimensionLabel = {
       departments: "Department",
       doctors: "Doctor",
       panels: "Panel",
     }[dimension];
-    $("#comparison-mover-net").textContent = rows.length
-      ? `Net change from ${periodLabels[firstIndex]} to ${periodLabels[lastIndex]} across all ${dimension}: `
-        + `${netChange > 0 ? "+" : netChange < 0 ? "−" : ""}`
-        + `${isCurrency ? compactMoney(Math.abs(netChange)) : number(Math.abs(netChange))}.`
-      : `${metricLabel} has no ${dimensionLabel.toLowerCase()} data for these periods.`;
     $("#comparison-movers-title").textContent =
       `${dimensionLabel} comparison (${periodLabels[firstIndex]} vs ${periodLabels[lastIndex]})`;
 
@@ -2086,7 +2309,7 @@ function renderComparisonTargetDonuts(data) {
   const labels = data.labels || [];
   const revenue = comparisonMetricValues(data, "Revenue");
   const targets = comparisonMetricValues(data, "Revenue target");
-  const colors = ["#315a78", "#b17a3e", "#168f88"];
+  const colors = ["#168f88", "#168f88", "#168f88"];
   const svgNS = "http://www.w3.org/2000/svg";
   const radius = 70;
   const circumference = 2 * Math.PI * radius;
@@ -2161,7 +2384,7 @@ function renderComparisonTargetDonuts(data) {
     key.append(
       keyItem(color, `Achieved ${achieved.toFixed(1)}%`),
       exceeded
-        ? keyItem("#1b6b4a", `Above target ${(achieved - 100).toFixed(1)}%`)
+        ? keyItem(COLORS.teal, `Above target ${(achieved - 100).toFixed(1)}%`)
         : keyItem("#dbe5eb", `Left ${Math.max(0, 100 - achieved).toFixed(1)}%`),
     );
     card.append(heading, rangeLine, svg, key);

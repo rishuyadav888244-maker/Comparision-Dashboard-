@@ -5,15 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#102f49">
   <title>Vedansh Medicare Pvt Ltd · Executive Dashboard</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20261014-compact-period-legend">
-  <script src="/assets/dashboard.js?v=20261014-compact-period-legend" defer></script>
-  <link rel="stylesheet" href="/assets/prediction.css">
-<script src="/assets/prediction.js" defer></script>
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20261019-no-chart-group-titles">
+  <script src="/assets/dashboard.js?v=20261019-dashboard-chart-alignment" defer></script>
+  <link rel="stylesheet" href="/assets/prediction.css?v=20261019-interactive-forecast-charts">
+  <script src="/assets/prediction.js?v=20261019-opd-services-db-filter" defer></script>
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="/" aria-label="Vedansh Medicare Pvt Ltd dashboard home">
-      <span class="brand-mark">V</span>
+      <img class="brand-logo" src="/assets/vedansh-logo.png" alt="Vedansh Medicare logo">
       <span class="brand-copy">
         <span class="brand-kicker">VEDANSH MEDICARE</span>
         <strong>Vedansh Medicare Pvt Ltd</strong>
@@ -23,10 +23,9 @@
       <button class="view-tab is-active" type="button" data-view="overview" aria-pressed="true">Dashboard</button>
       <button class="view-tab" type="button" data-view="comparison" aria-pressed="false">Comparison Dashboard</button>
     </nav>
-    <div class="topbar-period" aria-label="Reporting period">
-      <span>REPORTING PERIOD</span>
-      <strong id="date-range">Loading reporting period…</strong>
-      <small id="last-updated"></small>
+    <div class="topbar-period" aria-label="Data range">
+      <span>DATA RANGE</span>
+      <strong id="date-range">Loading data range…</strong>
     </div>
     <div class="topbar-right">
       <button class="button button-secondary" id="download-interactive" type="button">Download interactive HTML</button>
@@ -45,16 +44,50 @@
           <span>Saved dataset</span>
           <select id="dataset-select" aria-label="Saved dataset"></select>
         </label>
-        <label class="field">
-          <span>Month</span>
-          <select id="month-select" multiple size="1" aria-label="Filter by month"></select>
-          <small>Select multiple months with Ctrl or Command.</small>
-        </label>
-        <label class="field">
-          <span>Period</span>
-          <select id="period-select" multiple size="1" aria-label="Filter by period"></select>
-          <small>Optional date-of-month filter.</small>
-        </label>
+        <div class="field">
+          <span id="month-filter-label">Month</span>
+          <div class="multi-select" id="month-filter-widget">
+            <button
+              class="multi-select-trigger"
+              id="month-filter-trigger"
+              type="button"
+              aria-labelledby="month-filter-label month-filter-count"
+              aria-expanded="false"
+              aria-controls="month-filter-menu"
+            >
+              <span id="month-filter-count">0 selected</span><span aria-hidden="true">▾</span>
+            </button>
+            <div class="multi-select-menu" id="month-filter-menu" hidden>
+              <div class="multi-select-actions">
+                <button class="multi-select-action" type="button" data-multiselect-action="toggle-all">Select all</button>
+              </div>
+              <div class="multi-select-options" role="group" aria-labelledby="month-filter-label"></div>
+            </div>
+          </div>
+          <select id="month-select" multiple aria-label="Filter by month" hidden></select>
+        </div>
+        <div class="field">
+          <span id="period-filter-label">Period</span>
+          <div class="multi-select" id="period-filter-widget">
+            <button
+              class="multi-select-trigger"
+              id="period-filter-trigger"
+              type="button"
+              aria-labelledby="period-filter-label period-filter-count"
+              aria-expanded="false"
+              aria-controls="period-filter-menu"
+            >
+              <span id="period-filter-count">0 selected</span><span aria-hidden="true">▾</span>
+            </button>
+            <div class="multi-select-menu" id="period-filter-menu" hidden>
+              <div class="multi-select-actions">
+                <button class="multi-select-action" type="button" data-multiselect-action="toggle-all">Select all</button>
+              </div>
+              <div class="multi-select-options" role="group" aria-labelledby="period-filter-label"></div>
+            </div>
+          </div>
+          <select id="period-select" multiple aria-label="Filter by period" hidden></select>
+        </div>
         <div class="filter-actions">
           <button class="button button-primary" id="apply-filters" type="button">Apply filters</button>
           <button class="button button-secondary" id="export-button" type="button">Export CSV</button>
@@ -69,78 +102,99 @@
 
       <div id="kpi-grid" class="kpi-grid" aria-live="polite"></div>
 
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">NETWORK PERFORMANCE</p>
-          <h2>Revenue and patient activity</h2>
-          <p>Percent labels show each category's share of its total. Green and red trend labels indicate increases and decreases; patient flow, revenue achievement and panel financial charts show values only.</p>
-        </div>
-        <span class="section-note" id="record-count"></span>
-      </div>
       <div class="chart-grid chart-grid-lead">
         <article class="panel chart-card chart-card-wide">
-          <div class="chart-heading"><div><h3>IPD revenue trend</h3><p>Discharge revenue over the selected period</p></div><span class="chart-unit">₹ Revenue</span></div>
+          <div class="chart-heading"><div><h3>IPD revenue trend</h3></div></div>
           <div class="chart-wrap"><canvas id="revenue-chart" aria-label="IPD revenue trend chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>Patient flow</h3><p>Admissions and discharges</p></div><span class="legend"><i class="legend-dot teal"></i>Admissions <i class="legend-dot blue"></i>Discharges</span></div>
+          <div class="chart-heading"><div><h3>Patient flow</h3></div><span class="legend"><i class="legend-dot teal"></i>Admissions <i class="legend-dot blue"></i>Discharges</span></div>
           <div class="chart-wrap"><canvas id="flow-chart" aria-label="Admissions and discharges chart"></canvas></div>
         </article>
       </div>
       <div class="chart-grid">
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>Discharges by department</h3><p>Record volume by department</p></div></div>
+          <div class="chart-heading"><div><h3>Discharges by department</h3></div></div>
           <div class="chart-wrap"><canvas id="department-chart" aria-label="Discharges by department chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>Discharges by doctor</h3><p>Record volume by doctor</p></div></div>
+          <div class="chart-heading"><div><h3>Discharges by doctor</h3></div></div>
           <div class="chart-wrap"><canvas id="discharge-doctor-chart" aria-label="Discharges by doctor chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>IPD revenue by department</h3><p>Revenue contribution by department</p></div></div>
+          <div class="chart-heading"><div><h3>IPD revenue by department</h3></div></div>
           <div class="chart-wrap"><canvas id="ipd-department-chart" aria-label="IPD revenue by department chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>IPD revenue by doctor</h3><p>Revenue contribution by doctor</p></div></div>
+          <div class="chart-heading"><div><h3>IPD revenue by doctor</h3></div></div>
           <div class="chart-wrap"><canvas id="ipd-doctor-chart" aria-label="IPD revenue by doctor chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>Admissions by department</h3><p>Patient volume by department</p></div></div>
+          <div class="chart-heading"><div><h3>Admissions by department</h3></div></div>
           <div class="chart-wrap"><canvas id="admission-department-chart" aria-label="Admissions by department chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>Admissions by doctor</h3><p>Patient volume by doctor</p></div></div>
+          <div class="chart-heading"><div><h3>Admissions by doctor</h3></div></div>
           <div class="chart-wrap"><canvas id="admission-doctor-chart" aria-label="Admissions by doctor chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>OPD consultations by doctor</h3><p>Consultation volume by doctor</p></div></div>
+          <div class="chart-heading"><div><h3>OPD consultations by doctor</h3></div></div>
           <div class="chart-wrap"><canvas id="opd-doctor-chart" aria-label="OPD consultations by doctor chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>OPD services</h3><p>Service volume mix</p></div></div>
+          <div class="chart-heading"><div><h3>OPD services</h3></div></div>
           <div class="chart-wrap"><canvas id="services-chart" aria-label="OPD services chart"></canvas></div>
         </article>
         <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>OPD consultation trend</h3><p>Daily consultation activity</p></div></div>
+          <div class="chart-heading"><div><h3>OPD consultation trend</h3></div></div>
           <div class="chart-wrap"><canvas id="opd-trend-chart" aria-label="OPD consultation trend chart"></canvas></div>
         </article>
-        <article class="panel chart-card">
-          <div class="chart-heading"><div><h3>Revenue achievement</h3><p>Cumulative revenue against target</p></div></div>
-          <div class="chart-wrap"><canvas id="target-chart" aria-label="Revenue achievement against target chart"></canvas></div>
+        <article class="panel chart-card target-progress-card">
+          <div class="chart-heading"><div><h3>Cumulative revenue vs target</h3></div></div>
+          <div class="target-progress-wrap">
+            <div class="target-progress-stat target-progress-target">
+              <span>Target</span>
+              <strong id="target-progress-target">₹0</strong>
+            </div>
+            <div
+              class="target-progress-ring"
+              id="target-progress-ring"
+              role="progressbar"
+              aria-label="Cumulative revenue compared with target"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+              aria-valuetext="0.0% of target"
+            >
+              <svg class="target-progress-svg" viewBox="0 0 200 200" aria-hidden="true">
+                <circle class="target-progress-track" cx="100" cy="100" r="86"></circle>
+                <circle
+                  class="target-progress-arc"
+                  id="target-progress-arc"
+                  cx="100"
+                  cy="100"
+                  r="86"
+                  stroke-dasharray="0 540.4"
+                  transform="rotate(-90 100 100)"
+                ></circle>
+              </svg>
+              <div class="target-progress-center">
+                <strong id="target-progress-value">0.0%</strong>
+                <span>of target</span>
+              </div>
+            </div>
+            <div class="target-progress-stat target-progress-achieved">
+              <span>Achieved</span>
+              <strong id="target-progress-actual">₹0</strong>
+            </div>
+          </div>
         </article>
       </div>
       <div class="dashboard-lower-grid">
         <section class="dashboard-panel-performance">
-          <div class="section-heading panel-performance-title">
-            <div>
-              <p class="eyebrow">COLLECTIONS</p>
-              <h2>Panel revenue, collection and pending</h2>
-              <p>Percent labels show each panel's share of the corresponding financial total.</p>
-            </div>
-          </div>
           <article class="panel chart-card panel-performance-card">
             <div class="chart-heading">
-              <div><h3>Financial position by panel</h3><p>Collection is revenue less pending credit due</p></div>
+              <div><h3>Financial position by panel</h3></div>
               <span class="legend">
                 <i class="legend-dot teal"></i>Revenue
                 <i class="legend-dot blue"></i>Collection
@@ -151,10 +205,10 @@
           </article>
         </section>
         <section class="dashboard-insights">
-          <div class="section-heading insights-title">
-            <div><p class="eyebrow">EXECUTIVE SIGNALS</p><h2>Revenue insights</h2></div>
-          </div>
-          <div id="insights-grid" class="insights-grid"></div>
+          <article class="panel chart-card panel-insights-card">
+            <div class="chart-heading"><div><h3>Revenue insights</h3></div></div>
+            <div id="insights-grid" class="insights-grid"></div>
+          </article>
         </section>
       </div>
     </section>
@@ -173,7 +227,6 @@
                 <option value="charts">Charts</option>
               </select>
             </label>
-            <span class="comparison-header-badge">PERIOD COMPARISON</span>
           </div>
         </div>
         <div class="comparison-filter-grid">
@@ -197,17 +250,14 @@
         <section class="comparison-movers panel" aria-labelledby="comparison-movers-title">
           <div class="comparison-movers-heading">
             <div>
-              <p class="eyebrow">PERFORMANCE COMPARISON</p>
               <h2 id="comparison-movers-title">Department comparison</h2>
-              <p>All entities, ordered by change from lowest to highest.</p>
             </div>
-            <fieldset class="comparison-mover-measures">
-              <legend>Rank changes by</legend>
-              <label><input type="radio" name="comparison-mover-metric" value="ipdRevenue" checked> IPD Revenue</label>
-              <label><input type="radio" name="comparison-mover-metric" value="ipdDischarges"> IPD Discharges</label>
-              <label><input type="radio" name="comparison-mover-metric" value="ipdAdmissions"> IPD Admissions</label>
-              <label><input type="radio" name="comparison-mover-metric" value="opdConsultations"> OPD Consultations</label>
-              <label><input type="radio" name="comparison-mover-metric" value="opdServices"> OPD Services</label>
+            <fieldset class="comparison-mover-measures" aria-label="Choose ranking metric">
+              <label><input type="radio" name="comparison-mover-metric" value="ipdRevenue" checked><span>IPD Revenue</span></label>
+              <label><input type="radio" name="comparison-mover-metric" value="ipdDischarges"><span>IPD Discharges</span></label>
+              <label><input type="radio" name="comparison-mover-metric" value="ipdAdmissions"><span>IPD Admissions</span></label>
+              <label><input type="radio" name="comparison-mover-metric" value="opdConsultations"><span>OPD Consultations</span></label>
+              <label><input type="radio" name="comparison-mover-metric" value="opdServices"><span>OPD Services</span></label>
             </fieldset>
           </div>
           <div class="comparison-mover-tabs" role="tablist" aria-label="Rank movers by category">
@@ -215,20 +265,18 @@
             <button type="button" role="tab" aria-selected="false" data-mover-dimension="doctors">Doctors</button>
             <button type="button" role="tab" aria-selected="false" data-mover-dimension="panels">Panels</button>
           </div>
-          <p class="comparison-mover-net" id="comparison-mover-net" aria-live="polite"></p>
           <div class="comparison-mover-table-wrap" id="comparison-mover-list">
           </div>
         </section>
           <div class="comparison-chart-legend" id="comparison-trend-legend"></div>
           <div id="comparison-trend-tables" class="comparison-trend-tables"></div>
           <div class="section-heading insights-title" id="comparison-change-heading">
-            <div><p class="eyebrow">MANAGEMENT INSIGHTS</p><h2 id="comparison-summary-title">Summary — what changed</h2></div>
+            <div><h2 id="comparison-summary-title">Summary — what changed</h2></div>
           </div>
           <ul id="comparison-insights" class="comparison-summary" aria-live="polite"></ul>
         </div>
         <div id="comparison-charts-view" class="comparison-charts-only">
           <div class="comparison-chart-legend" id="comparison-chart-legend"></div>
-          <p class="eyebrow comparison-group-title">IPD ADMISSION</p>
           <div class="comparison-chart-grid-2">
             <article class="panel chart-card comparison-mini-card">
               <div class="chart-heading"><h3>IPD admission by department</h3></div>
@@ -241,7 +289,6 @@
               <div id="comparison-admission-doctors-chart-total" class="chart-total comparison-chart-total" aria-live="polite"></div>
             </article>
           </div>
-          <p class="eyebrow comparison-group-title">IPD DISCHARGE</p>
           <div class="comparison-chart-grid-2">
             <article class="panel chart-card comparison-mini-card">
               <div class="chart-heading"><h3>IPD discharge by department</h3></div>
@@ -254,7 +301,6 @@
               <div id="comparison-discharge-doctors-chart-total" class="chart-total comparison-chart-total" aria-live="polite"></div>
             </article>
           </div>
-          <p class="eyebrow comparison-group-title">OPD CONSULTATION</p>
           <div class="comparison-chart-grid-2">
             <article class="panel chart-card comparison-mini-card">
               <div class="chart-heading"><h3>OPD consultation by department</h3></div>
@@ -267,7 +313,6 @@
               <div id="comparison-opd-doctors-chart-total" class="chart-total comparison-chart-total" aria-live="polite"></div>
             </article>
           </div>
-          <p class="eyebrow comparison-group-title">OPD SERVICES</p>
           <div class="comparison-chart-grid-2">
             <article class="panel chart-card comparison-mini-card comparison-mini-card-wide">
               <div class="chart-heading"><h3>OPD services</h3></div>
@@ -275,7 +320,6 @@
               <div id="comparison-services-chart-total" class="chart-total comparison-chart-total" aria-live="polite"></div>
             </article>
           </div>
-          <p class="eyebrow comparison-group-title">IPD REVENUE</p>
           <div class="comparison-chart-grid-2">
             <article class="panel chart-card comparison-mini-card">
               <div class="chart-heading"><h3>IPD revenue by department</h3></div>
@@ -288,7 +332,7 @@
               <div id="comparison-ipd-doctors-chart-total" class="chart-total comparison-chart-total" aria-live="polite"></div>
             </article>
           </div>
-          <p class="eyebrow comparison-donut-eyebrow">TARGET ACHIEVEMENT · monthly target × months in the selected range</p>
+          <p class="eyebrow comparison-donut-eyebrow">TARGET ACHIEVEMENT</p>
           <div id="comparison-target-donuts" class="comparison-donut-grid"></div>
         </div>
       </div>

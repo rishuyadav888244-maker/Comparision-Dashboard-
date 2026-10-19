@@ -2,11 +2,14 @@
 
 /* Prediction view. Loaded after dashboard.js and reuses its shared helpers. */
 (() => {
-  const HORIZONS = {
-    Year: { unit: "months", values: [3, 6, 12], fallback: 6 },
-    Month: { unit: "years", values: [1, 2, 3], fallback: 1 },
-    Period: { unit: "months", values: [3, 6, 12], fallback: 3 },
-  };
+  const HORIZONS = [
+    { value: 1, label: "Next 1 month" },
+    { value: 2, label: "Next 2 months" },
+    { value: 3, label: "Next 3 months" },
+    { value: 4, label: "Next 4 months" },
+    { value: 6, label: "Next 6 months" },
+    { value: 12, label: "Next 1 year" },
+  ];
   const ui = { ready: false, data: null, view: "charts", loading: false };
 
   function el(tag, className = "", text = null) {
@@ -45,14 +48,6 @@
     controls.className = "prediction-filter-grid is-hidden";
     controls.innerHTML = `
       <label class="field"><span>Hospital</span><select id="prediction-hospital"></select></label>
-      <label class="field prediction-field-wide"><span>Predict using</span>
-        <select id="prediction-mode">
-          <option value="Year">Year · all months of data</option>
-          <option value="Month">Month · same month every year</option>
-          <option value="Period">Period · same period every month</option>
-        </select>
-      </label>
-      <div id="prediction-dynamic" class="prediction-dynamic-fields"></div>
       <label class="field"><span>Forecast ahead</span><select id="prediction-horizon"></select></label>
       <div class="comparison-filter-actions">
         <button class="button button-primary comparison-apply" id="apply-prediction" type="button">Predict</button>
@@ -64,8 +59,6 @@
     style.textContent = `
       #comparison-view .prediction-filter-grid { display: flex; flex-wrap: nowrap; align-items: flex-end; gap: 6px; }
       #comparison-view .prediction-filter-grid .field { flex: 1 1 140px; min-width: 0; }
-      #comparison-view .prediction-filter-grid .prediction-field-wide { flex: 1.5 1 200px; }
-      #comparison-view .prediction-filter-grid .prediction-dynamic-fields { display: contents; }
       #comparison-view .prediction-filter-grid .comparison-filter-actions { flex: 0 0 auto; }
       @media (max-width: 900px) { #comparison-view .prediction-filter-grid { flex-wrap: wrap; } }
       #prediction-kpis { grid-template-columns: repeat(5, minmax(0, 1fr)); }
@@ -107,15 +100,9 @@
       </div>`;
     comparison.append(results);
 
-    $("#prediction-hospital").addEventListener("change", (event) => {
-      const source = $("#comparison-hospital");
-      if (source) source.value = event.target.value;
-    });
-    $("#prediction-mode").addEventListener("change", buildModeFields);
     $("#apply-prediction").addEventListener("click", loadPrediction);
     $("#reset-prediction").addEventListener("click", () => {
-      $("#prediction-mode").value = "Year";
-      buildModeFields();
+      buildForecastHorizons();
       loadPrediction();
     });
     window.addEventListener("resize", drawCharts);
@@ -126,54 +113,40 @@
     const source = $("#comparison-hospital");
     const target = $("#prediction-hospital");
     if (!source || !target) return;
-    const values = [...source.options].map((option) => option.value);
-    addOptions(target, values.length ? values : ["All Hospitals"], {
-      selected: source.value || "All Hospitals",
-    });
+    const values = [...source.options]
+      .map((option) => option.value)
+      .filter((value) => value && value !== "All Hospitals");
+    if (!values.length) {
+      target.replaceChildren(new Option("No hospitals available", ""));
+      target.disabled = true;
+      return;
+    }
+    target.disabled = false;
+    const selected = [target.value, source.value].find((value) => values.includes(value))
+      || values[0];
+    addOptions(target, values, { selected });
   }
 
   function showPrediction() {
     if (ui.sync) ui.sync();
     if (!ui.ready) {
       ui.ready = true;
-      buildModeFields();
+      buildForecastHorizons();
       loadPrediction();
     } else {
       drawCharts();
     }
   }
 
-  function buildModeFields() {
-    const mode = $("#prediction-mode").value;
-    const holder = $("#prediction-dynamic");
-    holder.replaceChildren();
-    const addSelect = (label, name, values, selected) => {
-      const wrapper = el("label", "field");
-      const select = document.createElement("select");
-      select.name = name;
-      addOptions(select, values, { selected });
-      wrapper.append(el("span", "", label), select);
-      holder.append(wrapper);
-    };
-    if (mode === "Month") {
-      addSelect("Month", "month", MONTH_NAMES, MONTH_NAMES[new Date().getMonth()]);
-    } else if (mode === "Period") {
-      addSelect("Period", "period", PERIODS, PERIODS[0]);
-    }
-    const config = HORIZONS[mode];
-    addOptions($("#prediction-horizon"), config.values.map((value) => ({
-      value, label: `Next ${value} ${config.unit}`,
-    })), { selected: String(config.fallback) });
+  function buildForecastHorizons() {
+    addOptions($("#prediction-horizon"), HORIZONS, { selected: "12" });
   }
 
   function currentFilters() {
     const filters = {
-      predictBy: $("#prediction-mode").value,
+      predictBy: "Year",
       horizon: $("#prediction-horizon").value,
     };
-    document.querySelectorAll("#prediction-dynamic [name]").forEach((input) => {
-      filters[input.name] = input.value;
-    });
     return filters;
   }
 
@@ -184,8 +157,12 @@
     button.disabled = true;
     button.textContent = "Predicting…";
     try {
+      const hospital = $("#prediction-hospital").value;
+      if (!hospital || hospital === "All Hospitals") {
+        throw new Error("Choose a specific hospital before predicting.");
+      }
       const query = new URLSearchParams({
-        hospital: $("#prediction-hospital").value || "All Hospitals",
+        hospital,
         filters: JSON.stringify(currentFilters()),
       });
       const data = await request(`/api/prediction?${query.toString()}`);
@@ -207,11 +184,8 @@
   /* -------------------------------------------------------------- render */
   function render(data) {
     window.__PREDICTION_REPORT_DATA__ = data;
-    $("#prediction-title").textContent = `Next ${data.horizon} ${data.unit} forecast`;
-    $("#prediction-confidence").textContent = `Confidence: ${data.confidence}`
-      + (data.accuracy !== null && data.accuracy !== undefined
-        ? ` · typical error ±${data.accuracy}%`
-        : ` (${data.points} data points)`);
+    $("#prediction-title").textContent = `Next ${data.horizon} ${plural(data.unit, data.horizon)} forecast`;
+    $("#prediction-confidence").textContent = "";
     renderSummary(data);
     renderKpis(data);
     renderChartCards(data);
@@ -233,7 +207,7 @@
     if (!summary || !(summary.highlights || []).length) return;
     const heading = el("div", "section-heading");
     const titleBox = el("div");
-    titleBox.append(el("h2", "", `What is changing in the next ${data.horizon} ${data.unit}`));
+    titleBox.append(el("h2", "", `What is changing in the next ${data.horizon} ${plural(data.unit, data.horizon)}`));
     heading.append(titleBox);
     const list = el("ul", "comparison-summary");
     list.setAttribute("aria-live", "polite");
@@ -251,7 +225,6 @@
   function renderKpis(data) {
     const grid = $("#prediction-kpis");
     grid.replaceChildren();
-    const span = `${data.horizon} ${plural(data.unit, data.horizon)}`;
     KPI_KEYS.forEach((key) => {
       const metric = data.metrics.find((item) => item.key === key);
       if (!metric) return;
@@ -261,7 +234,7 @@
         el("span", "kpi-label", metric.label),
         el("div", "kpi-value", fullFormat(metric.kind)(summary.horizonTotal)),
       );
-      const sub = el("div", "kpi-sub", `Next ${span} · `);
+      const sub = el("div", "kpi-sub");
       // Compare per-period averages so a shorter history is still a fair comparison.
       const recentAverage = summary.recentCount ? summary.recentTotal / summary.recentCount : null;
       const pct = recentAverage ? (summary.horizonTotal / data.horizon - recentAverage) / recentAverage * 100 : null;
@@ -299,6 +272,7 @@
       const wrap = el("div", "chart-wrap");
       const canvas = document.createElement("canvas");
       canvas.setAttribute("aria-label", `${metric.label} forecast chart`);
+      canvas.tabIndex = 0;
       canvas.predictionMetric = {
         ...metric,
         rows: visibleRows(metric.rows, data),
@@ -310,7 +284,7 @@
       const format = fullFormat(metric.kind);
       renderTotalItems(footer, [
         { label: `Next · ${metric.summary.nextLabel}`, value: metric.summary.next, formatter: format },
-        { label: `Total next ${data.horizon} ${data.unit}`, value: metric.summary.horizonTotal, formatter: format },
+        { label: `Total next ${data.horizon} ${plural(data.unit, data.horizon)}`, value: metric.summary.horizonTotal, formatter: format },
       ]);
       card.append(footer);
       grid.append(card);
@@ -322,6 +296,7 @@
     { key: "discharges", label: "IPD discharges", kind: "count" },
     { key: "admissions", label: "IPD admissions", kind: "count" },
     { key: "opd", label: "OPD consultations", kind: "count" },
+    { key: "services", label: "OPD services", kind: "count" },
   ];
   const ENTITY_DIMENSIONS = [
     ["departments", "department"],
@@ -329,6 +304,7 @@
     ["panels", "panel"],
   ];
   ui.entityMetric = "ipd_revenue";
+  ui.entityDimension = "departments";
 
   function renderEntities(data) {
     const holder = $("#prediction-entities");
@@ -338,58 +314,63 @@
     const lastLabel = `Last (${summary.previousLabel})`;
     const nextLabel = `Forecast (${summary.nextLabel})`;
     const metric = ENTITY_METRICS.find((item) => item.key === ui.entityMetric) || ENTITY_METRICS[0];
+    const dimensionLabel = ENTITY_DIMENSIONS.find(([key]) => key === ui.entityDimension)?.[1] || "department";
+    const dimensionTitle = `${dimensionLabel[0].toUpperCase()}${dimensionLabel.slice(1)}`;
 
-    const heading = el("div", "section-heading");
-    const titleBox = el("div");
-    titleBox.append(el("h2", "", `Department, doctor and panel forecast · ${summary.nextLabel}`));
-    heading.append(titleBox);
+    const heading = el("div", "comparison-movers-heading prediction-breakdown-heading");
+    heading.append(el("h2", "", `${dimensionTitle} comparison (${summary.previousLabel} vs ${summary.nextLabel})`));
 
-    const tabs = el("div", "comparison-mover-tabs");
-    tabs.setAttribute("role", "tablist");
+    const measures = el("fieldset", "comparison-mover-measures prediction-entity-measures");
+    measures.setAttribute("aria-label", "Choose forecast measure");
     ENTITY_METRICS.forEach((item) => {
-      const button = el("button", "", item.label);
+      const label = el("label");
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "prediction-entity-metric";
+      radio.value = item.key;
+      radio.checked = item.key === metric.key;
+      radio.addEventListener("change", () => {
+        ui.entityMetric = item.key;
+        renderEntities(data);
+      });
+      label.append(radio, document.createTextNode(item.label));
+      measures.append(label);
+    });
+    heading.append(measures);
+
+    const tabs = el("div", "comparison-mover-tabs prediction-entity-tabs");
+    tabs.setAttribute("role", "tablist");
+    ENTITY_DIMENSIONS.forEach(([dimension, label]) => {
+      const button = el("button", "", `${label[0].toUpperCase()}${label.slice(1)}`);
       button.type = "button";
       button.setAttribute("role", "tab");
-      button.setAttribute("aria-selected", String(item.key === metric.key));
+      button.setAttribute("aria-selected", String(dimension === ui.entityDimension));
       button.addEventListener("click", () => {
-        ui.entityMetric = item.key;
+        ui.entityDimension = dimension;
         renderEntities(data);
       });
       tabs.append(button);
     });
 
-    const legend = el("div", "comparison-chart-legend");
-    [["", lastLabel], ["second", nextLabel]].forEach(([extra, text]) => {
-      const item = el("span", "comparison-chart-legend-item");
-      item.append(el("i", `comparison-chart-legend-dot${extra ? ` ${extra}` : ""}`), el("strong", "", text));
-      legend.append(item);
-    });
-
-    const grid = el("div", "comparison-chart-grid-2");
-    const containers = ENTITY_DIMENSIONS.map(([dimension, label], index) => {
-      const card = el("article",
-        `panel chart-card comparison-mini-card${index === 2 ? " comparison-mini-card-wide" : ""}`);
-      const cardHeading = el("div", "chart-heading");
-      cardHeading.append(el("h3", "", `${metric.label} by ${label}`));
-      const container = el("div", "comparison-column-chart comparison-compact-chart");
-      container.setAttribute("role", "img");
-      card.append(cardHeading, container);
-      grid.append(card);
-      return [dimension, container];
-    });
-    holder.append(heading, tabs, legend, grid);
+    const grid = el("div", "comparison-chart-grid-2 prediction-entity-chart-grid");
+    const card = el("article", "panel chart-card comparison-mini-card comparison-mini-card-wide");
+    const cardHeading = el("div", "chart-heading");
+    cardHeading.append(el("h3", "", `${metric.label} by ${ui.entityDimension.slice(0, -1)}`));
+    const container = el("div", "comparison-column-chart comparison-compact-chart");
+    container.setAttribute("role", "img");
+    card.append(cardHeading, container);
+    grid.append(card);
+    holder.append(heading, tabs, grid);
 
     const currency = metric.kind === "currency";
-    containers.forEach(([dimension, container]) => {
-      const rows = ((data.breakdown[dimension] || {})[metric.key] || []).map((row) => ({
-        label: row.name, first: row.previous, second: row.next,
-      }));
-      renderComparisonColumnChart(
-        container, rows,
-        [{ key: "first", label: lastLabel }, { key: "second", label: nextLabel }],
-        currency ? compactMoney : number, null, null, currency ? "currency" : "count",
-      );
-    });
+    const rows = ((data.breakdown[ui.entityDimension] || {})[metric.key] || []).map((row) => ({
+      label: row.name, first: row.previous, second: row.next,
+    }));
+    renderComparisonColumnChart(
+      container, rows,
+      [{ key: "first", label: lastLabel }, { key: "second", label: nextLabel }],
+      currency ? compactMoney : number, null, null, currency ? "currency" : "count",
+    );
   }
 
   function renderTables(data) {
@@ -606,7 +587,6 @@
     }
 
     // points, labels, hit boxes
-    const hitboxes = [];
     const valueLabels = [];
     const lastCompleteIndexes = new Set(complete.slice(-3).map(({ index }) => index));
     actualRows.forEach(({ row, index }) => {
@@ -622,11 +602,6 @@
       if (!row.partial && row.forecast === null && (row.focus || lastCompleteIndexes.has(index))) {
         valueLabels.push({ text: axisFormat(row.actual), x, y, color: COLORS.blue, priority: 1 });
       }
-      hitboxes.push({
-        x: x - 9, y: y - 9, width: 18, height: 18,
-        label: `${row.label} · actual${row.partial ? " so far (month incomplete)" : ""}`,
-        value: row.actual, formatter: tipFormat,
-      });
     });
     bandRows.forEach(({ row, index }) => {
       const x = xAt(index);
@@ -636,12 +611,34 @@
       ctx.fillStyle = COLORS.orange;
       ctx.fill();
       valueLabels.push({ text: axisFormat(row.forecast), x, y, color: "#a85f12", priority: 0 });
-      hitboxes.push({
-        x: x - 9, y: y - 9, width: 18, height: 18,
-        label: `${row.label} · forecast (likely ${tipFormat(row.lower)} – ${tipFormat(row.upper)})`,
-        value: row.forecast, formatter: tipFormat,
-      });
     });
+
+    const hoverIndex = Number.isInteger(metric.hoverIndex) ? metric.hoverIndex : -1;
+    if (hoverIndex >= 0 && rows[hoverIndex]) {
+      const row = rows[hoverIndex];
+      const value = row.forecast !== null ? row.forecast : row.actual;
+      if (Number.isFinite(value)) {
+        const x = xAt(hoverIndex);
+        const y = yAt(value);
+        ctx.save();
+        ctx.strokeStyle = "rgba(20, 53, 79, .3)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 4]);
+        ctx.beginPath();
+        ctx.moveTo(x, margin.top);
+        ctx.lineTo(x, margin.top + chartHeight);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.arc(x, y, 10, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(255, 255, 255, .82)";
+        ctx.fill();
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = row.forecast !== null ? COLORS.orange : COLORS.blue;
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
 
     ctx.font = "bold 10px Segoe UI, Arial";
     const placedLabels = [];
@@ -682,7 +679,88 @@
       lastLabelX = x;
       ctx.fillText(row.label, x, height - 15);
     });
-    attachChartTooltip(canvas, hitboxes);
+    attachForecastInteraction(canvas, metric, rows, xAt, yAt, tipFormat);
+  }
+
+  function attachForecastInteraction(canvas, metric, rows, xAt, yAt, formatter) {
+    const wrapper = canvas.parentElement;
+    let tooltip = wrapper.querySelector(".prediction-chart-tooltip");
+    if (!tooltip) {
+      tooltip = el("div", "prediction-chart-tooltip");
+      tooltip.setAttribute("role", "status");
+      wrapper.append(tooltip);
+    }
+
+    const showTooltip = (index, event) => {
+      const row = rows[index];
+      if (!row) return;
+      tooltip.replaceChildren(el("strong", "", row.label));
+      if (row.actual !== null) {
+        tooltip.append(el("span", "prediction-tooltip-actual",
+          `Actual${row.partial ? " (so far)" : ""}: ${formatter(row.actual)}`));
+      }
+      if (row.forecast !== null) {
+        tooltip.append(el("span", "prediction-tooltip-forecast", `Forecast: ${formatter(row.forecast)}`));
+        tooltip.append(el("span", "", `Likely range: ${formatter(row.lower)} – ${formatter(row.upper)}`));
+      }
+      if (Number.isFinite(row.target)) {
+        tooltip.append(el("span", "prediction-tooltip-target", `Target: ${formatter(row.target)}`));
+      }
+      tooltip.classList.add("is-visible");
+      const rect = canvas.getBoundingClientRect();
+      const x = event ? event.clientX - rect.left : xAt(index);
+      const y = event ? event.clientY - rect.top : yAt(row.forecast ?? row.actual);
+      const maxLeft = Math.max(4, wrapper.clientWidth - tooltip.offsetWidth - 5);
+      tooltip.style.left = `${Math.max(4, Math.min(maxLeft, x + 11))}px`;
+      const gap = 10;
+      const below = y + gap;
+      const above = y - tooltip.offsetHeight - gap;
+      const top = below + tooltip.offsetHeight <= wrapper.clientHeight - 4
+        ? below
+        : Math.max(4, above);
+      tooltip.style.top = `${top}px`;
+    };
+    const hideTooltip = () => tooltip.classList.remove("is-visible");
+    const setActiveIndex = (index, event) => {
+      if (index < 0 || index >= rows.length) return;
+      if (metric.hoverIndex !== index) {
+        metric.hoverIndex = index;
+        drawForecastChart(canvas, metric);
+      }
+      showTooltip(index, event);
+    };
+
+    canvas.style.cursor = "crosshair";
+    canvas.onpointermove = (event) => {
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      let closestIndex = -1;
+      let closestDistance = Infinity;
+      rows.forEach((row, index) => {
+        if (row.actual === null && row.forecast === null) return;
+        const distance = Math.abs(xAt(index) - x);
+        if (distance < closestDistance) {
+          closestDistance = distance;
+          closestIndex = index;
+        }
+      });
+      if (closestDistance <= 28) setActiveIndex(closestIndex, event);
+      else hideTooltip();
+    };
+    canvas.onpointerleave = hideTooltip;
+    canvas.onfocus = () => {
+      const index = Number.isInteger(metric.hoverIndex) ? metric.hoverIndex : 0;
+      setActiveIndex(index);
+    };
+    canvas.onkeydown = (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const current = Number.isInteger(metric.hoverIndex) ? metric.hoverIndex : 0;
+      const next = event.key === "Home" ? 0
+        : event.key === "End" ? rows.length - 1
+          : Math.max(0, Math.min(rows.length - 1, current + (event.key === "ArrowRight" ? 1 : -1)));
+      setActiveIndex(next);
+    };
   }
 
   buildView();

@@ -81,6 +81,46 @@ function offlineRange(rows) {
   return dates.length ? [dates[0], dates[dates.length - 1]] : [null, null];
 }
 
+function offlineSelectedDays(rows, months = [], periods = []) {
+  const [start, end] = offlineRange(rows);
+  if (!start || !end) return 0;
+
+  const selectedMonths = new Set(months.map((month) => OFFLINE_MONTHS.indexOf(month) + 1));
+  const selectedPeriods = new Set(periods);
+  const bounds = selectedPeriods.size
+    ? [...selectedPeriods]
+    : OFFLINE_PERIODS;
+  const startDate = new Date(`${start}T00:00:00Z`);
+  const endDate = new Date(`${end}T00:00:00Z`);
+  let month = new Date(Date.UTC(startDate.getUTCFullYear(), startDate.getUTCMonth(), 1));
+  let days = 0;
+  while (month <= endDate) {
+    const year = month.getUTCFullYear();
+    const monthIndex = month.getUTCMonth();
+    const monthNumber = monthIndex + 1;
+    const lastDay = new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+    if (!selectedMonths.size || selectedMonths.has(monthNumber)) {
+      bounds.forEach((period) => {
+        const firstDay = period === OFFLINE_PERIODS[0] ? 1
+          : period === OFFLINE_PERIODS[1] ? 11 : 21;
+        const finalDay = period === OFFLINE_PERIODS[0] ? 10
+          : period === OFFLINE_PERIODS[1] ? 20 : lastDay;
+        const periodStart = Math.max(
+          startDate.getTime(), Date.UTC(year, monthIndex, firstDay),
+        );
+        const periodEnd = Math.min(
+          endDate.getTime(), Date.UTC(year, monthIndex, Math.min(finalDay, lastDay)),
+        );
+        if (periodEnd >= periodStart) {
+          days += (periodEnd - periodStart) / 86400000 + 1;
+        }
+      });
+    }
+    month = new Date(Date.UTC(year, monthIndex + 1, 1));
+  }
+  return days;
+}
+
 function offlineFilter(rows, months = [], periods = []) {
   const monthSet = new Set(months.map((name) => OFFLINE_MONTHS.indexOf(name) + 1));
   const periodSet = new Set(periods);
@@ -177,7 +217,7 @@ function offlineDashboardTarget(monthlyTarget, start, end, months, periods) {
   return offlineTargetForRanges(monthlyTarget, ranges);
 }
 
-function offlineKpis(rows, hospital, target) {
+function offlineKpis(rows, hospital, target, selectedDays = offlineSelectedDays(rows)) {
   const discharge = (row) => offlineField(row, "type") === "Discharge";
   const opd = (row) => offlineField(row, "type") === "OPD";
   const admissions = rows.filter((row) => offlineField(row, "type") === "Admission").length;
@@ -193,6 +233,9 @@ function offlineKpis(rows, hospital, target) {
     opd_revenue: opdRevenue,
     cash_due: offlineSum(rows, discharge, "cash"),
     credit_due: offlineSum(rows, discharge, "credit"),
+    arpp: discharges.length ? ipdRevenue / discharges.length : 0,
+    per_day_patient_charge: bedDays ? ipdRevenue / bedDays : 0,
+    per_day_revenue: selectedDays ? (ipdRevenue + opdRevenue) / selectedDays : 0,
     opd_consultation: rows.filter((row) => opd(row)
       && String(offlineField(row, "serviceType") || "").toLowerCase() === "consultation").length,
     admissions,
@@ -244,7 +287,6 @@ function offlineInsights(rows, monthlyTarget) {
   }).length;
   const grossAvailable = opdRows.some((row) => Number(offlineField(row, "serviceAmount")) > 0);
   const opdGross = grossAvailable ? sum(opdRows, "serviceAmount") : null;
-  const discount = opdGross === null ? null : Math.max(0, opdGross - opdRevenue);
   const ipdBilling = ipdRows.some((row) => Number(offlineField(row, "serviceAmount")) > 0)
     ? sum(ipdRows, "serviceAmount") : ipdRevenue;
   const pending = sum(ipdRows, "credit");
@@ -261,9 +303,7 @@ function offlineInsights(rows, monthlyTarget) {
     ["🩺", "Top earning doctor", leaderValue(doctor, doctorRevenue)],
     ["🏷️", "Top paying panel", leaderValue(panel, panelRevenue)],
     ["💳", "Payment still pending", `${offlineInsightMoney(pending)} (${share(pending, ipdBilling).toFixed(0)}% of IPD billing)`],
-    ["🧾", "OPD gross amount", opdGross === null ? "—" : offlineInsightMoney(opdGross)],
     ["✅", "OPD final amount (received)", opdGross > 0 ? `${offlineInsightMoney(opdRevenue)} (${share(opdRevenue, opdGross).toFixed(0)}% of gross)` : offlineInsightMoney(opdRevenue)],
-    ["🏷️", "OPD discount / concession", discount === null ? "—" : `${offlineInsightMoney(discount)} (${share(discount, opdGross).toFixed(0)}% of gross)`],
   ].map(([icon, label, value]) => ({ icon, label, value }));
   return {
     department, doctor, panel,
@@ -423,7 +463,9 @@ function offlineDashboard(query) {
   const [start, end] = offlineRange(allRows);
   const monthlyTarget = offlineMonthlyTarget(dataset.hospital_name);
   const target = offlineDashboardTarget(monthlyTarget, start, end, months, periods);
-  const kpis = offlineKpis(rows, dataset.hospital_name, target);
+  const kpis = offlineKpis(
+    rows, dataset.hospital_name, target, offlineSelectedDays(allRows, months, periods),
+  );
   return {
     hasData: true,
     dataset,
@@ -643,7 +685,7 @@ function offlineComparison(rows, query) {
   const pairChart = (left, right) => {
     const names = new Set([...left.keys(), ...right.keys()]);
     return [...names].map((label) => ({ label, first: left.get(label) || 0, second: right.get(label) || 0 }))
-      .sort((a, b) => Math.max(b.first, b.second) - Math.max(a.first, a.second)).slice(0, 10);
+      .sort((a, b) => Math.max(b.first, b.second) - Math.max(a.first, a.second));
   };
   const pairMoverRows = (left, right) => {
     const names = new Set([...left.keys(), ...right.keys()]);
@@ -1025,11 +1067,15 @@ window.fetch = async (input, options = {}) => {
     } else if (pathname === "/api/prediction") {
       const hospital = url.searchParams.get("hospital") || "All Hospitals";
       const filters = JSON.parse(url.searchParams.get("filters") || "{}");
-      const mode = filters.predictBy || "Year";
-      const month = mode === "Month" ? filters.month || "" : "";
-      const period = mode === "Period" ? filters.period || "" : "";
-      const horizon = String(filters.horizon || 6);
-      const key = JSON.stringify([hospital, mode, month, period, horizon]);
+      const horizon = String(filters.horizon || 12);
+      if (hospital === "All Hospitals") {
+        return new Response(JSON.stringify({
+          error: "Choose a specific hospital before predicting.",
+        }), {
+          status: 400, headers: { "Content-Type": "application/json" },
+        });
+      }
+      const key = JSON.stringify([hospital, horizon]);
       payload = window.__OFFLINE_DATA__.predictions?.[key];
       if (!payload) {
         return new Response(JSON.stringify({

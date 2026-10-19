@@ -113,6 +113,12 @@ def export_interactive_html():
     offline_js = (static_dir / "offline-dashboard.js").read_text(encoding="utf-8")
     prediction_js = (static_dir / "prediction.js").read_text(encoding="utf-8")
     prediction_css = (static_dir / "prediction.css").read_text(encoding="utf-8")
+    logo = base64.b64encode((static_dir / "vedansh-logo.png").read_bytes()).decode("ascii")
+    page = page.replace(
+        'src="/assets/vedansh-logo.png"',
+        f'src="data:image/png;base64,{logo}"',
+        1,
+    )
     page = re.sub(
         r'  <link rel="stylesheet" href="/assets/dashboard\.css[^"]*">\r?\n',
         f"  <style>\n{css}\n  </style>\n",
@@ -153,43 +159,24 @@ def export_interactive_html():
 def _offline_prediction_cache(datasets):
     import prediction_service
 
-    hospitals = ["All Hospitals", *sorted({
+    hospitals = sorted({
         str(item["hospital_name"]).strip()
         for item in datasets
         if item.get("hospital_name")
-    })]
-    configurations = [
-        ("Year", "", "", 12, (3, 6, 12)),
-        *[
-            ("Month", month, "", 3, (1, 2, 3))
-            for month in prediction_service._MONTHS
-        ],
-        *[
-            ("Period", "", period, 12, (3, 6, 12))
-            for period in prediction_service._PERIOD_BOUNDS
-        ],
-    ]
+    })
+    horizons = (1, 2, 3, 4, 6, 12)
     results = {}
     for hospital in hospitals:
-        for mode, month, period, max_horizon, horizons in configurations:
-            filters = {"predictBy": mode, "horizon": str(max_horizon)}
-            if month:
-                filters["month"] = month
-            if period:
-                filters["period"] = period
-            base = prediction_service.get_prediction({
-                "hospital": hospital,
-                "filters": filters,
-            })
-            for horizon in horizons:
-                key = json.dumps(
-                    [hospital, mode, month, period, str(horizon)],
-                    separators=(",", ":"),
-                )
-                results[key] = (
-                    base if horizon == max_horizon
-                    else _prediction_horizon_variant(base, horizon)
-                )
+        base = prediction_service.get_prediction({
+            "hospital": hospital,
+            "filters": {"predictBy": "Year", "horizon": "12"},
+        })
+        for horizon in horizons:
+            key = json.dumps([hospital, str(horizon)], separators=(",", ":"))
+            results[key] = (
+                base if horizon == 12
+                else _prediction_horizon_variant(base, horizon)
+            )
     return results
 
 
@@ -375,6 +362,48 @@ def _dashboard_target_by_period(monthly_target, start, end, months, periods):
     return target_by_period
 
 
+def _dashboard_selected_days(frame, months=(), periods=()):
+    event_dates = pd.to_datetime(
+        backend.comparison_event_dates(frame), errors="coerce"
+    ).dropna()
+    if event_dates.empty:
+        return 0
+
+    start = event_dates.min().normalize()
+    end = event_dates.max().normalize()
+    selected_months = set()
+    for month in months:
+        parsed = pd.to_datetime(str(month), format="%B", errors="coerce")
+        if pd.isna(parsed):
+            parsed = pd.to_datetime(str(month), format="%b", errors="coerce")
+        if pd.notna(parsed):
+            selected_months.add(parsed.month)
+
+    period_bounds = {
+        backend.PERIOD_OPTIONS[0]: (1, 10),
+        backend.PERIOD_OPTIONS[1]: (11, 20),
+        backend.PERIOD_OPTIONS[2]: (21, 31),
+    }
+    selected_periods = set(periods) or set(backend.PERIOD_OPTIONS)
+    selected_days = 0
+    month_start = start.replace(day=1)
+    while month_start <= end:
+        month_end = month_start + pd.offsets.MonthEnd(0)
+        if not selected_months or month_start.month in selected_months:
+            for period in selected_periods:
+                first_day, last_day = period_bounds[period]
+                period_start = month_start + pd.Timedelta(days=first_day - 1)
+                period_end = min(
+                    month_end, month_start + pd.Timedelta(days=last_day - 1)
+                )
+                covered_start = max(start, period_start)
+                covered_end = min(end, period_end)
+                if covered_end >= covered_start:
+                    selected_days += (covered_end - covered_start).days + 1
+        month_start += pd.offsets.MonthBegin(1)
+    return selected_days
+
+
 def _dashboard_target_progress(frame, target_by_period, selected_periods=()):
     period_revenue = dict.fromkeys(backend.PERIOD_OPTIONS, 0.0)
     report_type = frame.get(
@@ -525,7 +554,6 @@ def _group_top(frame, dimension, value):
         rows.groupby(dimension, as_index=False)[value]
         .sum()
         .sort_values(value, ascending=False, kind="stable")
-        .head(10)
     )
     return _records(grouped.rename(columns={dimension: "label", value: "value"}))
 
@@ -738,6 +766,13 @@ def _get_dashboard_cached(dataset_id, months, periods, version):
     kpis["target"] = sum(target_by_period.values())
     kpis["achievement"] = (
         kpis["revenue"] / kpis["target"] * 100 if kpis["target"] else 0
+    )
+    kpis["arpp"] = _ratio(kpis["ipd_revenue"], kpis["discharges"])
+    kpis["per_day_patient_charge"] = _ratio(
+        kpis["ipd_revenue"], kpis["bed_days"]
+    )
+    kpis["per_day_revenue"] = _ratio(
+        kpis["revenue"], _dashboard_selected_days(frame, months, periods)
     )
     return _json_value({
         "hasData": True,
