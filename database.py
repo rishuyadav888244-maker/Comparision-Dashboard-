@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -13,6 +15,7 @@ import pandas as pd
 
 
 DATABASE_PATH = Path(__file__).resolve().parent / "hospital_data.db"
+UPLOADS_DIR = Path(__file__).resolve().parent / "uploads" / "raw_reports"
 BASE_COLUMNS = [
     "id",
     "hospital_name",
@@ -147,6 +150,28 @@ def init_database():
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_hospital_data_dataset_id "
             "ON hospital_data (dataset_id, id)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_report_uploads (
+                upload_id TEXT PRIMARY KEY,
+                hospital_name TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL,
+                included INTEGER NOT NULL DEFAULT 1,
+                storage_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                rows_read INTEGER NOT NULL DEFAULT 0,
+                rows_used INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (hospital_name, content_hash)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_raw_report_uploads_hospital "
+            "ON raw_report_uploads (hospital_name, uploaded_at, upload_id)"
         )
         connection.execute("DROP INDEX IF EXISTS idx_hospital_data_dataset")
         connection.commit()
@@ -456,6 +481,337 @@ def delete_dataset(dataset_id):
         )
         connection.commit()
     return cursor.rowcount
+
+
+def raw_dataset_id(hospital_name):
+    hospital_key = str(hospital_name).strip().casefold()
+    if not hospital_key:
+        raise ValueError("A hospital name is required.")
+    digest = hashlib.sha256(hospital_key.encode("utf-8")).hexdigest()
+    return "raw-" + digest
+
+
+def list_report_uploads(hospital_name):
+    if not hospital_name:
+        raise ValueError("A hospital name is required.")
+    init_database()
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT upload_id, hospital_name, file_name, kind, content_hash,
+                   uploaded_at, included, file_size, rows_read, rows_used
+            FROM raw_report_uploads
+            WHERE hospital_name = ?
+            ORDER BY uploaded_at, upload_id
+            """,
+            (hospital_name,),
+        ).fetchall()
+    return [
+        {**dict(row), "included": bool(row["included"])}
+        for row in rows
+    ]
+
+
+def list_report_hospital_names():
+    init_database()
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT hospital_name, MAX(uploaded_at) AS latest_upload
+            FROM raw_report_uploads
+            GROUP BY hospital_name
+            ORDER BY latest_upload DESC, hospital_name
+            """
+        ).fetchall()
+    return [row["hospital_name"] for row in rows]
+
+
+def get_report_upload(upload_id):
+    if not upload_id:
+        raise ValueError("A report upload ID is required.")
+    init_database()
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT upload_id, hospital_name, file_name, kind, content_hash,
+                   uploaded_at, included, storage_path, file_size, rows_read,
+                   rows_used
+            FROM raw_report_uploads
+            WHERE upload_id = ?
+            """,
+            (upload_id,),
+        ).fetchone()
+    if row is None:
+        raise ValueError("The selected report upload is not available.")
+    item = dict(row)
+    item["included"] = bool(item["included"])
+    return item
+
+
+def load_report_uploads(hospital_name, included_only=True):
+    if not hospital_name:
+        raise ValueError("A hospital name is required.")
+    init_database()
+    conditions = ["hospital_name = ?"]
+    parameters = [hospital_name]
+    if included_only:
+        conditions.append("included = 1")
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT upload_id, hospital_name, file_name, kind, content_hash,
+                   uploaded_at, included, storage_path, file_size, rows_read,
+                   rows_used
+            FROM raw_report_uploads
+            WHERE """ + " AND ".join(conditions) + """
+            ORDER BY uploaded_at, upload_id
+            """,
+            parameters,
+        ).fetchall()
+    uploads = []
+    for row in rows:
+        item = dict(row)
+        path = _report_storage_path(item["storage_path"])
+        item["file_bytes"] = path.read_bytes()
+        item["included"] = bool(item["included"])
+        uploads.append(item)
+    return uploads
+
+
+def commit_report_upload_changes(
+    hospital_name,
+    merged_frame,
+    combined_hash,
+    uploads_to_add=(),
+    upload_to_delete=None,
+    include_change=None,
+    report_stats=(),
+):
+    """Persist report-file changes and replace only this hospital's raw dataset."""
+    if not hospital_name:
+        raise ValueError("A hospital name is required.")
+    if upload_to_delete and include_change is not None:
+        raise ValueError("A report upload cannot be deleted and toggled together.")
+
+    init_database()
+    created_paths = []
+    deleted_path = None
+    added_uploads = []
+    dataset_id = raw_dataset_id(hospital_name)
+    upload_date = datetime.now(timezone.utc).isoformat()
+
+    with _connect() as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for upload in uploads_to_add:
+                file_bytes = upload["file_bytes"]
+                content_hash = _upload_hash(file_bytes)
+                existing = connection.execute(
+                    """
+                    SELECT upload_id
+                    FROM raw_report_uploads
+                    WHERE hospital_name = ? AND content_hash = ?
+                    """,
+                    (hospital_name, content_hash),
+                ).fetchone()
+                if existing:
+                    added_uploads.append({
+                        "upload_id": existing["upload_id"],
+                        "duplicate": True,
+                    })
+                    continue
+
+                storage_path, created = _store_report_bytes(
+                    hospital_name, upload["file_name"], content_hash, file_bytes
+                )
+                if created:
+                    created_paths.append(_report_storage_path(storage_path))
+                upload_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO raw_report_uploads (
+                        upload_id, hospital_name, file_name, kind, content_hash,
+                        uploaded_at, included, storage_path, file_size,
+                        rows_read, rows_used
+                    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        upload_id,
+                        hospital_name,
+                        upload["file_name"],
+                        upload["kind"],
+                        content_hash,
+                        upload_date,
+                        storage_path,
+                        len(file_bytes),
+                        int(upload.get("rows_read", 0)),
+                        int(upload.get("rows_used", 0)),
+                    ),
+                )
+                added_uploads.append({"upload_id": upload_id, "duplicate": False})
+
+            if upload_to_delete:
+                existing = connection.execute(
+                    """
+                    SELECT storage_path
+                    FROM raw_report_uploads
+                    WHERE upload_id = ? AND hospital_name = ?
+                    """,
+                    (upload_to_delete, hospital_name),
+                ).fetchone()
+                if existing is None:
+                    raise ValueError("The selected report upload is not available.")
+                deleted_path = _report_storage_path(existing["storage_path"])
+                connection.execute(
+                    "DELETE FROM raw_report_uploads WHERE upload_id = ?",
+                    (upload_to_delete,),
+                )
+
+            if include_change is not None:
+                upload_id, included = include_change
+                cursor = connection.execute(
+                    """
+                    UPDATE raw_report_uploads
+                    SET included = ?
+                    WHERE upload_id = ? AND hospital_name = ?
+                    """,
+                    (int(bool(included)), upload_id, hospital_name),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("The selected report upload is not available.")
+
+            for item in report_stats:
+                connection.execute(
+                    """
+                    UPDATE raw_report_uploads
+                    SET rows_read = ?, rows_used = ?
+                    WHERE upload_id = ? AND hospital_name = ?
+                    """,
+                    (
+                        int(item["rows_read"]),
+                        int(item["rows_used"]),
+                        item["upload_id"],
+                        hospital_name,
+                    ),
+                )
+
+            merged_count = _replace_raw_dataset(
+                connection,
+                merged_frame,
+                hospital_name,
+                dataset_id,
+                combined_hash,
+                upload_date,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            for path in created_paths:
+                if path.exists():
+                    path.unlink()
+            raise
+
+    if deleted_path is not None and deleted_path.exists():
+        deleted_path.unlink()
+    return {
+        "dataset_id": dataset_id,
+        "record_count": merged_count,
+        "uploads": added_uploads,
+        "deleted": upload_to_delete is not None,
+    }
+
+
+def _replace_raw_dataset(
+    connection, frame, hospital_name, dataset_id, upload_hash, upload_date
+):
+    connection.execute(
+        "DELETE FROM hospital_data WHERE dataset_id = ? AND source_file = ?",
+        (dataset_id, "Combined raw reports"),
+    )
+    if frame is None or frame.empty:
+        return 0
+
+    existing_columns = _existing_columns(connection)
+    prepared = _prepare_frame(frame.copy(), existing_columns)
+    if prepared.empty or not len(prepared.columns):
+        raise ValueError("The combined raw reports have no usable data columns.")
+    prepared = prepared.where(pd.notna(prepared), None)
+    columns = list(prepared.columns)
+    _ensure_columns(connection, columns, existing_columns)
+    table_columns = BASE_COLUMNS + columns
+    quoted_columns = ", ".join(
+        _quote_identifier(column) for column in table_columns
+    )
+    placeholders = ", ".join("?" for _ in table_columns)
+    statement = (
+        f"INSERT INTO hospital_data ({quoted_columns}) "
+        f"VALUES ({placeholders})"
+    )
+    records = []
+    for row_number, (_, row) in enumerate(prepared.iterrows()):
+        values = {
+            column: _normalise_for_hash(row[column])
+            if row[column] is not None else None
+            for column in columns
+        }
+        values["record_hash"] = _record_hash(
+            row, columns, hospital_name, upload_hash, row_number
+        )
+        records.append(
+            [
+                None,
+                hospital_name,
+                "Combined raw reports",
+                upload_date,
+                upload_hash,
+                dataset_id,
+                values["record_hash"],
+            ] + [values.get(column) for column in columns]
+        )
+    connection.executemany(statement, records)
+    return len(records)
+
+
+def _store_report_bytes(hospital_name, file_name, content_hash, file_bytes):
+    hospital_hash = hashlib.sha256(
+        str(hospital_name).strip().casefold().encode("utf-8")
+    ).hexdigest()
+    suffix = Path(file_name).suffix.casefold()
+    if suffix not in {".xlsx", ".xls", ".csv"}:
+        raise ValueError("Raw reports must be .xlsx, .xls, or .csv files.")
+    target = UPLOADS_DIR / hospital_hash / f"{content_hash}{suffix}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if _upload_hash(target.read_bytes()) != content_hash:
+            raise OSError("Stored report content does not match its content hash.")
+        return target.relative_to(UPLOADS_DIR).as_posix(), False
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=target.parent,
+            prefix=target.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(file_bytes)
+        os.replace(temporary_path, target)
+    except Exception:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
+    return target.relative_to(UPLOADS_DIR).as_posix(), True
+
+
+def _report_storage_path(storage_path):
+    relative = Path(storage_path)
+    root = UPLOADS_DIR.resolve()
+    path = (root / relative).resolve()
+    if relative.is_absolute() or not path.is_relative_to(root):
+        raise ValueError("The stored report path is invalid.")
+    return path
 
 
 def export_hospital_data(destination, hospital_name=None, file_format="xlsx"):

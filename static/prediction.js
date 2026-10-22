@@ -106,6 +106,7 @@
       loadPrediction();
     });
     window.addEventListener("resize", drawCharts);
+    window.addEventListener("dashboard-chart-resize", drawCharts);
     window.addEventListener("comparison-prediction-selected", showPrediction);
   }
 

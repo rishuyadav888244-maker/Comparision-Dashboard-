@@ -172,6 +172,78 @@ class WebDashboardServiceTests(unittest.TestCase):
             ],
         )
 
+    def test_full_range_dashboard_trends_are_grouped_by_year(self):
+        full_range = dashboard_service.get_dashboard({
+            "hospital": "Surya Hospital",
+        })
+        charts = full_range["charts"]
+
+        self.assertEqual(charts["granularity"], "yearly")
+        self.assertEqual(
+            [(row["label"], row["value"]) for row in charts["revenueTrend"]],
+            [("2025", 1000), ("2026", 2000)],
+        )
+        self.assertEqual(
+            [
+                (
+                    row["label"],
+                    row.get("Admissions", 0),
+                    row.get("Discharges", 0),
+                )
+                for row in charts["patientFlow"]
+            ],
+            [("2025", 0, 1), ("2026", 0, 1)],
+        )
+        self.assertEqual(
+            [(row["label"], row["value"]) for row in charts["opdDaily"]],
+            [("2025", 1)],
+        )
+
+        selected_range = dashboard_service.get_dashboard({
+            "hospital": "Surya Hospital",
+            "startDate": "2025-01-08",
+            "endDate": "2026-01-08",
+        })
+        self.assertEqual(selected_range["charts"]["granularity"], "daily")
+        self.assertNotEqual(
+            [row["label"] for row in selected_range["charts"]["revenueTrend"]],
+            ["2025", "2026"],
+        )
+
+    def test_custom_month_range_trends_include_all_filtered_chart_values(self):
+        result = dashboard_service.get_dashboard({
+            "hospital": "Surya Hospital",
+            "startDate": "2025-01-08",
+            "endDate": "2025-01-09",
+        })
+        charts = result["charts"]
+
+        self.assertEqual(charts["granularity"], "daily")
+        self.assertEqual(
+            sum(row["value"] for row in charts["revenueTrend"]),
+            result["kpis"]["ipd_revenue"],
+        )
+        self.assertEqual(
+            sum(row.get("Discharges", 0) for row in charts["patientFlow"]),
+            result["kpis"]["discharges"],
+        )
+        self.assertEqual(
+            sum(row.get("Admissions", 0) for row in charts["patientFlow"]),
+            result["kpis"]["admissions"],
+        )
+        self.assertEqual(
+            sum(row["value"] for row in charts["opdDaily"]),
+            result["kpis"]["opd_consultation"],
+        )
+        self.assertEqual(
+            [row["label"] for row in charts["revenueTrend"]],
+            ["08 Jan"],
+        )
+        self.assertEqual(
+            [row["label"] for row in charts["opdDaily"]],
+            ["09 Jan"],
+        )
+
     def test_dashboard_selected_days_respect_month_period_and_calendar_boundaries(self):
         frame = pd.DataFrame([
             {"Type": "Discharge", "DOD": "2024-01-08"},
@@ -279,6 +351,80 @@ class WebDashboardServiceTests(unittest.TestCase):
         )
         self.assertEqual(period["11-20 Days"], 0)
         self.assertEqual(period["21-31 Days"], 0)
+
+    def test_full_range_target_uses_hospital_monthly_target_and_plausible_dates(self):
+        old_rows = self.rows_2025.iloc[[0]].copy()
+        old_rows["DOA"] = "1900-01-01"
+        old_rows["DOD"] = "1900-01-01"
+        old_rows["UHID"] = "LEGACY-OUTLIER"
+
+        for hospital, monthly_target in (
+            ("Surya Hospital", 50_000_000),
+            ("NIMMS Hospital", 25_500_000),
+        ):
+            if hospital == "NIMMS Hospital":
+                database.save_hospital_data(
+                    self.rows_2025, hospital, "nimms-2025-target.xlsx",
+                    b"nimms-2025-target",
+                )
+                database.save_hospital_data(
+                    self.rows_2026, hospital, "nimms-2026-target.xlsx",
+                    b"nimms-2026-target",
+                )
+            database.save_hospital_data(
+                old_rows, hospital, f"{hospital}-legacy-target.xlsx",
+                f"{hospital}-legacy-target".encode(),
+            )
+
+            with self.subTest(hospital=hospital):
+                result = dashboard_service.get_dashboard({"hospital": hospital})
+                self.assertAlmostEqual(
+                    result["charts"]["totals"]["targetProgress"]["target"],
+                    monthly_target * 24,
+                    delta=0.01,
+                )
+                self.assertEqual(
+                    result["charts"]["totals"]["targetProgress"]["monthlyTarget"],
+                    monthly_target,
+                )
+                self.assertEqual(
+                    result["dateRange"]["start"],
+                    "2025-01-08",
+                )
+                self.assertEqual(
+                    result["dateRange"]["end"],
+                    "2026-01-09",
+                )
+
+        all_hospitals = dashboard_service.get_dashboard({
+            "hospital": "All Hospitals",
+        })
+        self.assertEqual(
+            all_hospitals["charts"]["totals"]["targetProgress"]["monthlyTarget"],
+            75_500_000,
+        )
+
+    def test_three_year_nimms_full_range_target_uses_three_calendar_years(self):
+        for year in (2024, 2025, 2026):
+            rows = self.rows_2025.copy()
+            rows["DOA"] = rows["DOA"].str.replace("2025", str(year))
+            rows["DOD"] = rows["DOD"].fillna("").str.replace("2025", str(year))
+            database.save_hospital_data(
+                rows,
+                "NIMMS Hospital",
+                f"nimms-{year}.xlsx",
+                f"nimms-{year}".encode(),
+            )
+
+        result = dashboard_service.get_dashboard({
+            "hospital": "NIMMS Hospital",
+        })
+        target = result["charts"]["totals"]["targetProgress"]
+
+        self.assertEqual(result["dateRange"]["start"], "2024-01-08")
+        self.assertEqual(result["dateRange"]["end"], "2026-01-09")
+        self.assertEqual(target["monthlyTarget"], 25_500_000)
+        self.assertAlmostEqual(target["target"], 25_500_000 * 36, delta=0.01)
 
     @patch("prediction_service.get_prediction", return_value={"hasData": False, "message": "No data"})
     def test_interactive_export_is_self_contained_and_omits_patient_ids(self, get_prediction):
@@ -505,6 +651,33 @@ class WebDashboardServiceTests(unittest.TestCase):
         self.assertEqual(result["summary"]["periodDays"], [365, 365])
         self.assertEqual(result["summary"]["totalRevenue"], [1250, 2500])
         self.assertEqual(result["summary"]["ipdRevenue"], [1000, 2000])
+
+    def test_comparison_summary_uses_selected_date_ranges(self):
+        result = dashboard_service.get_comparison({
+            "hospital": "Surya Hospital",
+            "filters": {
+                "compareBy": "From-To",
+                "start1": "2025-01-05",
+                "end1": "2025-01-08",
+                "start2": "2026-01-05",
+                "end2": "2026-01-08",
+            },
+        })
+
+        revenue = next(
+            metric for metric in result["metrics"]
+            if metric["label"] == "Revenue"
+        )
+        self.assertEqual([revenue["first"], revenue["second"]], [1000, 2000])
+        self.assertEqual(result["summary"]["totalRevenue"], [1000, 2000])
+        self.assertEqual(result["summary"]["periodDays"], [4, 4])
+        self.assertEqual(
+            [value / days for value, days in zip(
+                result["summary"]["totalRevenue"],
+                result["summary"]["periodDays"],
+            )],
+            [250, 500],
+        )
 
     def test_comparison_includes_populated_trend_series(self):
         result = dashboard_service.get_comparison({
@@ -914,6 +1087,18 @@ class WebDashboardServiceTests(unittest.TestCase):
             [2000, 0, 0],
         )
         self.assertEqual(existing_periods["recordCounts"], [2, 0, 0])
+        existing_revenue_trend = existing_periods["trends"]["revenue"]
+        self.assertEqual(
+            [row["label"] for row in existing_revenue_trend["rows"]],
+            [str(day) for day in range(1, 32)],
+        )
+        self.assertEqual(
+            next(
+                row for row in existing_revenue_trend["rows"]
+                if row["label"] == "8"
+            )["first"],
+            2000,
+        )
         self.assertEqual(
             existing_periods["revenueTrend"]["rows"][0]["first"], 2000
         )
@@ -941,6 +1126,30 @@ class WebDashboardServiceTests(unittest.TestCase):
                 "Service Name": "Consultation", "Service Final Amount": 2500,
                 "Cash Due": 200, "Credit Due": 0, "Bed Days": 1, "UHID": "U6",
             },
+            {
+                "DOA": "05/01/2026", "DOD": None, "Month": "January",
+                "Dept. Name": "Lab Department", "Doctor Name": "Dr Lab",
+                "Panel Name": "Panel Lab", "Type": "OPD",
+                "Service Type": "Laboratory", "Service Name": "CBC",
+                "Service Final Amount": 100, "Cash Due": 0, "Credit Due": 0,
+                "Bed Days": 0, "UHID": "U7",
+            },
+            {
+                "DOA": "15/01/2026", "DOD": None, "Month": "January",
+                "Dept. Name": "Lab Department", "Doctor Name": "Dr Lab",
+                "Panel Name": "Panel Lab", "Type": "OPD",
+                "Service Type": "Laboratory", "Service Name": "CBC",
+                "Service Final Amount": 100, "Cash Due": 0, "Credit Due": 0,
+                "Bed Days": 0, "UHID": "U8",
+            },
+            {
+                "DOA": "25/01/2026", "DOD": None, "Month": "January",
+                "Dept. Name": "Lab Department", "Doctor Name": "Dr Lab",
+                "Panel Name": "Panel Lab", "Type": "OPD",
+                "Service Type": "Laboratory", "Service Name": "CBC",
+                "Service Final Amount": 100, "Cash Due": 0, "Credit Due": 0,
+                "Bed Days": 0, "UHID": "U9",
+            },
         ])
         database.save_hospital_data(
             extra_rows, "Surya Hospital", "surya-january-periods.xlsx", b"periods"
@@ -965,8 +1174,30 @@ class WebDashboardServiceTests(unittest.TestCase):
             if row["name"] == "Medicine"
         )
         self.assertEqual(medicine_mover["values"], [0, 1500, 0])
+        lab_service_mover = next(
+            row for row in result["moverData"]["opdServices"]["departments"]
+            if row["name"] == "Lab Department"
+        )
+        self.assertEqual(lab_service_mover["values"], [1, 1, 1])
         self.assertEqual(len(result["chartTotals"]["dischargeDepartments"]), 3)
         self.assertEqual(len(result["revenueTrend"]["totals"]), 3)
+        revenue_trend = result["trends"]["revenue"]["rows"]
+        self.assertEqual(
+            [row["label"] for row in revenue_trend],
+            [str(day) for day in range(1, 32)],
+        )
+        self.assertEqual(
+            {
+                row["label"]: (
+                    row.get("first", 0),
+                    row.get("second", 0),
+                    row.get("third", 0),
+                )
+                for row in revenue_trend
+                if any(row.get(key, 0) for key in ("first", "second", "third"))
+            },
+            {"8": (2000, 0, 0), "15": (0, 1500, 0), "25": (0, 0, 2500)},
+        )
         discharge_rows = result["charts"]["dischargeDepartments"]
         self.assertTrue(all(
             any(key in row for row in discharge_rows)
@@ -1003,6 +1234,14 @@ class WebDashboardServiceTests(unittest.TestCase):
         self.assertEqual(
             next(metric for metric in one_period["metrics"] if metric["label"] == "IPD revenue")["values"],
             [1500],
+        )
+        one_period_revenue_trend = one_period["trends"]["revenue"]["rows"]
+        self.assertEqual(
+            next(
+                row for row in one_period_revenue_trend
+                if row["label"] == "15"
+            )["first"],
+            1500,
         )
 
     def test_comparison_uses_hospital_specific_monthly_revenue_targets(self):

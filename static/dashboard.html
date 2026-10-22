@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#102f49">
   <title>Vedansh Medicare Pvt Ltd · Executive Dashboard</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=20261019-panel-chart-matched-size">
-  <script src="/assets/dashboard.js?v=20261019-comparison-header-date-range" defer></script>
+  <link rel="stylesheet" href="/assets/dashboard.css?v=20261022-compact-dashboard-sections">
+  <script src="/assets/dashboard.js?v=20261020-all-hospitals-default" defer></script>
   <link rel="stylesheet" href="/assets/prediction.css?v=20261019-interactive-forecast-charts">
   <script src="/assets/prediction.js?v=20261019-opd-services-db-filter" defer></script>
 </head>
@@ -28,7 +28,7 @@
       <strong id="date-range">Loading data range…</strong>
     </div>
     <div class="topbar-right">
-      <button class="button button-secondary" id="download-interactive" type="button">Download interactive HTML</button>
+      <button class="button button-secondary" id="download-interactive" type="button" title="Download an interactive dashboard for offline use" aria-label="Download interactive dashboard for offline use">Offline HTML</button>
       <small id="download-interactive-status" role="status" aria-live="polite"></small>
       <button class="icon-button" id="print-button" type="button" title="Print or save as PDF" aria-label="Print or save as PDF">⤓</button>
     </div>
@@ -38,66 +38,97 @@
   <main class="app-layout">
     <div class="page-shell">
     <section id="overview-view">
-    <section class="filters-panel" aria-label="Dashboard filters">
-      <div class="filter-grid">
-        <label class="field">
-          <span>Saved dataset</span>
-          <select id="dataset-select" aria-label="Saved dataset"></select>
+    <section class="filters-panel dashboard-toolbar" aria-label="Dashboard controls">
+      <div class="dashboard-toolbar-main">
+        <label class="field hospital-filter-field">
+          <span>Hospital</span>
+          <select id="hospital-select" aria-label="Selected hospital">
+            <option value="All Hospitals">All Hospitals</option>
+          </select>
         </label>
-        <div class="field">
-          <span id="month-filter-label">Month</span>
-          <div class="multi-select" id="month-filter-widget">
-            <button
-              class="multi-select-trigger"
-              id="month-filter-trigger"
-              type="button"
-              aria-labelledby="month-filter-label month-filter-count"
-              aria-expanded="false"
-              aria-controls="month-filter-menu"
-            >
-              <span id="month-filter-count">0 selected</span><span aria-hidden="true">▾</span>
-            </button>
-            <div class="multi-select-menu" id="month-filter-menu" hidden>
-              <div class="multi-select-actions">
-                <button class="multi-select-action" type="button" data-multiselect-action="toggle-all">Select all</button>
-              </div>
-              <div class="multi-select-options" role="group" aria-labelledby="month-filter-label"></div>
+        <div id="range-controls" class="dashboard-range-controls" aria-label="Dashboard date range">
+          <label class="field">
+            <span>Range type</span>
+            <select id="range-type">
+              <option>Full Range</option>
+              <option>Year</option>
+              <option>Month</option>
+              <option>Period</option>
+              <option>Week</option>
+              <option>Day</option>
+              <option>Custom From-To</option>
+            </select>
+          </label>
+          <label class="field" id="range-year-field" hidden>
+            <span>Select year</span>
+            <select id="range-year-select"></select>
+          </label>
+          <label class="field" id="range-month-year-field" hidden>
+            <span>Select year</span>
+            <select id="range-month-year-select"></select>
+          </label>
+          <label class="field" id="range-month-field" hidden>
+            <span>Select month</span>
+            <select id="range-month-select"></select>
+          </label>
+          <label class="field" id="range-period-year-field" hidden>
+            <span>Select year</span>
+            <select id="range-period-year-select"></select>
+          </label>
+          <label class="field" id="range-period-month-field" hidden>
+            <span>Select month</span>
+            <select id="range-period-month-select"></select>
+          </label>
+          <label class="field" id="range-period-field" hidden>
+            <span>Select period</span>
+            <select id="range-period-select"></select>
+          </label>
+          <label class="field" id="range-anchor-field">
+            <span>Select date</span>
+            <input id="range-anchor" type="date">
+          </label>
+          <label class="field range-custom-field" id="range-from-field" hidden>
+            <span>From</span>
+            <input id="range-from" type="date">
+          </label>
+          <label class="field range-custom-field" id="range-to-field" hidden>
+            <span>To</span>
+            <input id="range-to" type="date">
+          </label>
+          <button class="button button-primary" id="apply-range" type="button">Apply</button>
+          <button class="text-button" id="clear-filters" type="button">Clear</button>
+        </div>
+
+        <details class="upload-management-panel toolbar-dropdown" id="upload-management">
+          <summary>Manage data <span id="upload-summary-count">0 reports</span></summary>
+          <div class="upload-management-content">
+            <div class="upload-management-controls">
+              <label class="field upload-hospital-field">
+                <span>Hospital</span>
+                <select id="upload-hospital-select" aria-label="Hospital for upload"></select>
+              </label>
+              <label class="field upload-files-field">
+                <span>Reports or merged workbooks (select multiple files to upload)</span>
+                <input
+                  id="upload-files"
+                  type="file"
+                  accept=".csv,.xlsx,.xls"
+                  multiple
+                >
+              </label>
+              <span id="upload-status" role="status" aria-live="polite"></span>
             </div>
-          </div>
-          <select id="month-select" multiple aria-label="Filter by month" hidden></select>
-        </div>
-        <div class="field">
-          <span id="period-filter-label">Period</span>
-          <div class="multi-select" id="period-filter-widget">
-            <button
-              class="multi-select-trigger"
-              id="period-filter-trigger"
-              type="button"
-              aria-labelledby="period-filter-label period-filter-count"
-              aria-expanded="false"
-              aria-controls="period-filter-menu"
-            >
-              <span id="period-filter-count">0 selected</span><span aria-hidden="true">▾</span>
-            </button>
-            <div class="multi-select-menu" id="period-filter-menu" hidden>
-              <div class="multi-select-actions">
-                <button class="multi-select-action" type="button" data-multiselect-action="toggle-all">Select all</button>
-              </div>
-              <div class="multi-select-options" role="group" aria-labelledby="period-filter-label"></div>
+            <div class="data-management-actions">
+              <button class="button button-secondary" id="export-button" type="button">Export CSV</button>
+              <button class="text-button" type="button" id="refresh-data">Refresh data</button>
             </div>
+            <div id="upload-list" class="upload-list" aria-live="polite"></div>
           </div>
-          <select id="period-select" multiple aria-label="Filter by period" hidden></select>
-        </div>
-        <div class="filter-actions">
-          <button class="button button-primary" id="apply-filters" type="button">Apply filters</button>
-          <button class="button button-secondary" id="export-button" type="button">Export CSV</button>
-          <button class="text-button" type="button" id="refresh-data">Refresh</button>
-          <button class="text-button" type="button" id="clear-filters">Clear</button>
-          <label class="button button-upload" for="upload-file">＋ Upload</label>
-          <input id="upload-file" type="file" accept=".xlsx,.xls">
-          <button class="button button-secondary" id="delete-dataset" type="button">Delete dataset</button>
-        </div>
+        </details>
       </div>
+      <p id="no-data-in-range" class="range-empty-message" role="status" hidden>
+        No data in this range.
+      </p>
     </section>
 
       <div id="kpi-grid" class="kpi-grid" aria-live="polite"></div>
@@ -153,8 +184,9 @@
           <div class="chart-heading"><div><h3>Cumulative revenue vs target</h3></div></div>
           <div class="target-progress-wrap">
             <div class="target-progress-stat target-progress-target">
-              <span>Target</span>
+              <span>Cumulative target</span>
               <strong id="target-progress-target">₹0</strong>
+              <small id="target-progress-monthly">Monthly target: ₹0</small>
             </div>
             <div
               class="target-progress-ring"
@@ -183,9 +215,15 @@
                 <span>of target</span>
               </div>
             </div>
-            <div class="target-progress-stat target-progress-achieved">
-              <span>Achieved</span>
-              <strong id="target-progress-actual">₹0</strong>
+            <div class="target-progress-results">
+              <div class="target-progress-stat target-progress-achieved">
+                <span>Achieved</span>
+                <strong id="target-progress-actual">₹0</strong>
+              </div>
+              <div class="target-progress-stat target-progress-remaining">
+                <span>Remaining target</span>
+                <strong id="target-progress-remaining">₹0</strong>
+              </div>
             </div>
           </div>
         </article>
@@ -268,7 +306,6 @@
           <div class="comparison-mover-table-wrap" id="comparison-mover-list">
           </div>
         </section>
-          <div class="comparison-chart-legend" id="comparison-trend-legend"></div>
           <div id="comparison-trend-tables" class="comparison-trend-tables"></div>
           <div class="section-heading insights-title" id="comparison-change-heading">
             <div><h2 id="comparison-summary-title">Summary — what changed</h2></div>
@@ -276,7 +313,6 @@
           <ul id="comparison-insights" class="comparison-summary" aria-live="polite"></ul>
         </div>
         <div id="comparison-charts-view" class="comparison-charts-only">
-          <div class="comparison-chart-legend" id="comparison-chart-legend"></div>
           <div class="comparison-chart-grid-2">
             <article class="panel chart-card comparison-mini-card">
               <div class="chart-heading"><h3>IPD admission by department</h3></div>

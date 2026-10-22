@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 from datetime import date
 from io import BytesIO
 from functools import lru_cache
 import json
 import re
+import threading
 import zlib
 from pathlib import Path
 
@@ -14,6 +16,7 @@ import pandas as pd
 
 import backend
 import database
+import report_combiner
 
 
 _OFFLINE_ROW_COLUMNS = [
@@ -21,6 +24,8 @@ _OFFLINE_ROW_COLUMNS = [
     "Panel Name", "Service Type", "Service Name", "Service Final Amount",
     "Cash Due", "Credit Due", "Bed Days", "Service Amount",
 ]
+_REPORT_UPLOAD_LOCK = threading.RLock()
+_KNOWN_HOSPITALS = ("NIMMS Hospital", "Surya Hospital", "Default Hospital")
 
 
 def _json_value(value):
@@ -68,7 +73,7 @@ def export_interactive_html():
             "source_file": item["source_file"],
             "hospital_name": item["hospital_name"],
             "upload_date": item["upload_date"],
-            "record_count": item["record_count"],
+            "record_count": len(frame),
             "date_start": _json_value(date_range[0]),
             "date_end": _json_value(date_range[1]),
         })
@@ -283,6 +288,15 @@ def _cached_dataset_frame(dataset_id, version):
     return frame
 
 
+@lru_cache(maxsize=16)
+def _cached_hospital_frame(hospital_name, version):
+    frame = backend.clean_data(
+        database.load_hospital_data(hospital_name=hospital_name)
+    )
+    frame["__comparison_event_date"] = backend.comparison_event_dates(frame)
+    return frame
+
+
 @lru_cache(maxsize=4)
 def _cached_master_frame(version):
     frame = backend.clean_data(database.load_all_hospital_data())
@@ -290,14 +304,58 @@ def _cached_master_frame(version):
     return frame
 
 
-def _month_names(frame):
-    dates = backend.comparison_event_dates(frame).dropna()
+def _month_names(frame, today=None):
+    dates = _plausible_event_dates(frame, today)
     available = set(int(month) for month in dates.dt.month.unique())
     return [
         pd.Timestamp(2000, month, 1).strftime("%B")
         for month in range(1, 13)
         if month in available
     ]
+
+
+def _plausible_event_dates(frame, today=None):
+    dates = backend.comparison_event_dates(frame).dropna()
+    if dates.empty:
+        return dates
+    reference_date = (
+        pd.Timestamp.today().normalize()
+        if today is None else pd.Timestamp(today).normalize()
+    )
+    return dates.loc[
+        dates.dt.year.ge(2000)
+        & dates.le(reference_date + pd.Timedelta(days=366))
+    ]
+
+
+def _date_picker_options(frame, today=None):
+    dates = _plausible_event_dates(frame, today)
+    year_months = []
+    if not dates.empty:
+        month_numbers = (
+            pd.DataFrame({"year": dates.dt.year, "month": dates.dt.month})
+            .drop_duplicates()
+            .sort_values(["year", "month"])
+        )
+        for year, month_group in month_numbers.groupby("year", sort=True):
+            year_months.append({
+                "year": int(year),
+                "months": [
+                    {
+                        "value": int(month),
+                        "label": pd.Timestamp(2000, int(month), 1).strftime("%B"),
+                    }
+                    for month in month_group["month"]
+                ],
+            })
+    return {
+        "years": [item["year"] for item in year_months],
+        "monthsByYear": year_months,
+        "dateRange": {
+            "start": dates.min().strftime("%Y-%m-%d") if not dates.empty else None,
+            "end": dates.max().strftime("%Y-%m-%d") if not dates.empty else None,
+        },
+    }
 
 
 def _target_for_ranges(monthly_target, ranges):
@@ -316,6 +374,49 @@ def _target_for_ranges(monthly_target, ranges):
             target += monthly_target * covered_days / month_end.day
             month_start += pd.offsets.MonthBegin(1)
     return target
+
+
+def _dashboard_target_for_range(monthly_target, start, end, months, periods):
+    target_by_period = dict.fromkeys(backend.PERIOD_OPTIONS, 0.0)
+    if start is None or end is None:
+        return target_by_period
+
+    selected_months = set()
+    for month in months:
+        parsed = pd.to_datetime(str(month), format="%B", errors="coerce")
+        if pd.isna(parsed):
+            parsed = pd.to_datetime(str(month), format="%b", errors="coerce")
+        if pd.notna(parsed):
+            selected_months.add(parsed.month)
+
+    selected_periods = set(periods) or set(backend.PERIOD_OPTIONS)
+    period_bounds = {
+        backend.PERIOD_OPTIONS[0]: (1, 10),
+        backend.PERIOD_OPTIONS[1]: (11, 20),
+        backend.PERIOD_OPTIONS[2]: (21, 31),
+    }
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
+    month_start = start.replace(day=1)
+    while month_start <= end:
+        month_end = month_start + pd.offsets.MonthEnd(0)
+        if not selected_months or month_start.month in selected_months:
+            for period in selected_periods:
+                first_day, last_day = period_bounds[period]
+                period_start = max(
+                    start,
+                    month_start.replace(day=first_day),
+                )
+                period_end = min(
+                    end,
+                    month_start.replace(day=min(last_day, month_end.day)),
+                )
+                if period_end >= period_start:
+                    target_by_period[period] += _target_for_ranges(
+                        monthly_target, [(period_start, period_end)]
+                    )
+        month_start += pd.offsets.MonthBegin(1)
+    return target_by_period
 
 
 def _dashboard_target_by_period(monthly_target, start, end, months, periods):
@@ -475,29 +576,42 @@ def _hospital_scope(frame, name):
 def dashboard_options():
     database.init_database()
     datasets = _dataset_metadata()
-    hospitals = sorted({
+    dataset_hospitals = {
         item["hospital_name"]
         for item in datasets
         if item.get("hospital_name")
-    })
+    }
+    report_hospitals = database.list_report_hospital_names()
+    hospitals = sorted(
+        dataset_hospitals | set(report_hospitals) | set(_KNOWN_HOSPITALS)
+    )
     result = {
         "datasets": datasets,
         "hospitals": hospitals,
         "periods": list(backend.PERIOD_OPTIONS),
     }
-    if datasets:
-        latest = datasets[0]
+    default_hospital = "All Hospitals"
+    if default_hospital:
         version = _data_version(datasets)
-        frame = _cached_dataset_frame(latest["dataset_id"], version)
-        start, end = backend.data_date_range(frame)
-        result["defaultDatasetId"] = latest["dataset_id"]
+        frame = _cached_master_frame(version)
+        date_options = _date_picker_options(frame)
+        result["defaultHospital"] = default_hospital
+        result["defaultDatasetId"] = None
         result["months"] = _month_names(frame)
-        result["dateRange"] = {
-            "start": start,
-            "end": end,
-        }
+        result["dateRange"] = date_options["dateRange"]
+        result["dateOptions"] = date_options
     else:
-        result.update(defaultDatasetId=None, months=[], dateRange=None)
+        result.update(
+            defaultHospital=None,
+            defaultDatasetId=None,
+            months=[],
+            dateRange=None,
+            dateOptions={
+                "years": [],
+                "monthsByYear": [],
+                "dateRange": {"start": None, "end": None},
+            },
+        )
 
     result["comparison"] = _comparison_options_for_datasets(datasets)
     return _json_value(result)
@@ -506,7 +620,7 @@ def dashboard_options():
 @lru_cache(maxsize=4)
 def _cached_comparison_options(version):
     frame = database.load_comparison_date_data()
-    dates = backend.comparison_event_dates(frame).dropna()
+    dates = _plausible_event_dates(frame)
     available_months = set(int(month) for month in dates.dt.month.unique())
     return {
         "years": sorted(int(year) for year in dates.dt.year.unique()),
@@ -535,7 +649,9 @@ def _bucket_dates(frame, column, value_column, granularity="daily"):
     rows = rows.dropna(subset=[column])
     if rows.empty:
         return []
-    if granularity == "monthly":
+    if granularity == "yearly":
+        rows["label"] = rows[column].dt.strftime("%Y")
+    elif granularity == "monthly":
         rows["label"] = rows[column].dt.to_period("M").dt.strftime("%b %Y")
     else:
         rows["label"] = rows[column].dt.strftime("%d %b")
@@ -572,9 +688,13 @@ def _sum_records(rows, column):
 
 
 def _dashboard_charts(frame, kpis, month_filter, monthly_target=None,
-                      target_by_period=None, period_filter=()):
+                      target_by_period=None, period_filter=(),
+                      yearly_trends=False):
     trend_rows = backend.daily_revenue(frame)
-    granularity = "monthly" if len(trend_rows) > 45 else "daily"
+    granularity = (
+        "yearly" if yearly_trends else
+        "monthly" if len(trend_rows) > 45 else "daily"
+    )
     if not trend_rows.empty:
         trend = _bucket_dates(trend_rows, "DOD", "Revenue", granularity)
     else:
@@ -586,7 +706,9 @@ def _dashboard_charts(frame, kpis, month_filter, monthly_target=None,
         if not flow.empty:
             flow["Date"] = pd.to_datetime(flow["Date"], errors="coerce")
             flow["label"] = (
-                flow["Date"].dt.to_period("M").dt.strftime("%b %Y")
+                flow["Date"].dt.strftime("%Y")
+                if granularity == "yearly"
+                else flow["Date"].dt.to_period("M").dt.strftime("%b %Y")
                 if granularity == "monthly"
                 else flow["Date"].dt.strftime("%d %b")
             )
@@ -703,6 +825,7 @@ def _dashboard_charts(frame, kpis, month_filter, monthly_target=None,
         "targetProgress": {
             "actual": target_progress_actual,
             "target": target_progress_target,
+            "monthlyTarget": monthly_target or backend.DEFAULT_TARGET,
         },
     }
     return {
@@ -720,7 +843,30 @@ def get_dashboard(query):
     datasets = _dataset_metadata()
     if not datasets:
         return {"hasData": False, "datasets": []}
-    dataset_id = query.get("datasetId") or datasets[0]["dataset_id"]
+    legacy_dataset_id = None
+    hospitals = sorted({
+        item["hospital_name"] for item in datasets if item.get("hospital_name")
+    } | set(database.list_report_hospital_names()))
+    if query.get("hospital"):
+        hospital_name = str(query["hospital"]).strip()
+        if hospital_name.casefold() == "all hospitals":
+            hospital_name = "All Hospitals"
+    elif query.get("datasetId"):
+        legacy_dataset_id = query["datasetId"]
+        selected_dataset = next(
+            (
+                item for item in datasets
+                if item["dataset_id"] == legacy_dataset_id
+            ),
+            None,
+        )
+        if selected_dataset is None:
+            raise ValueError("The selected dataset is not available.")
+        hospital_name = selected_dataset["hospital_name"]
+    else:
+        hospital_name = "All Hospitals"
+    if hospital_name != "All Hospitals" and hospital_name not in hospitals:
+        raise ValueError("The selected hospital is not available.")
     months = query.get("month", [])
     periods = query.get("period", [])
     if isinstance(months, str):
@@ -730,39 +876,135 @@ def get_dashboard(query):
     invalid_periods = set(periods) - set(backend.PERIOD_OPTIONS)
     if invalid_periods:
         raise ValueError("One or more selected periods are invalid.")
+    start_date = query.get("startDate")
+    end_date = query.get("endDate")
+    if bool(start_date) != bool(end_date):
+        raise ValueError("Both range start and end dates are required.")
+    if start_date:
+        try:
+            start_date = pd.Timestamp(start_date).normalize()
+            end_date = pd.Timestamp(end_date).normalize()
+        except (TypeError, ValueError) as error:
+            raise ValueError("The selected date range is invalid.") from error
+        if pd.isna(start_date) or pd.isna(end_date) or end_date < start_date:
+            raise ValueError("The selected date range is invalid.")
+        start_date = start_date.strftime("%Y-%m-%d")
+        end_date = end_date.strftime("%Y-%m-%d")
     return _get_dashboard_cached(
-        dataset_id,
+        hospital_name,
         tuple(months),
         tuple(periods),
+        start_date or "",
+        end_date or "",
+        legacy_dataset_id or "",
         _data_version(datasets),
+        pd.Timestamp.today().strftime("%Y-%m-%d"),
     )
 
 
 @lru_cache(maxsize=16)
-def _get_dashboard_cached(dataset_id, months, periods, version):
+def _get_dashboard_cached(
+    hospital_name, months, periods, start_date, end_date, dataset_id, version,
+    picker_today,
+):
     datasets = _dataset_metadata()
     if not datasets:
         return {"hasData": False, "datasets": []}
 
-    selected = next(
-        (item for item in datasets if item["dataset_id"] == dataset_id),
+    selected_dataset = next(
+        (
+            item for item in datasets
+            if dataset_id and item["dataset_id"] == dataset_id
+        ),
         None,
     )
-    if selected is None:
-        raise ValueError("The selected dataset is not available.")
+    frame = (
+        _cached_dataset_frame(dataset_id, version).copy()
+        if selected_dataset
+        else _cached_master_frame(version).copy()
+        if hospital_name == "All Hospitals"
+        else _cached_hospital_frame(hospital_name, version).copy()
+    )
+    date_options = _date_picker_options(frame, today=picker_today)
+    picker_range = date_options["dateRange"]
+    min_date = (
+        pd.Timestamp(picker_range["start"])
+        if picker_range["start"] else None
+    )
+    max_date = (
+        pd.Timestamp(picker_range["end"])
+        if picker_range["end"] else None
+    )
+    if frame.empty:
+        return {
+            "hasData": False,
+            "datasets": datasets,
+            "dataset": selected_dataset or {
+                "hospital_name": hospital_name,
+                "source_file": "All saved data",
+                "dataset_id": database.raw_dataset_id(hospital_name),
+            },
+            "dateRange": {"start": None, "end": None},
+            "selectedRange": {"start": None, "end": None},
+            "recordCount": 0,
+            "filters": {"month": list(months), "period": list(periods)},
+            "options": {"months": [], "periods": backend.PERIOD_OPTIONS},
+            "dateOptions": date_options,
+        }
+    if start_date and end_date:
+        selected_start = pd.Timestamp(start_date)
+        selected_end = pd.Timestamp(end_date)
+        if not picker_range["start"] or not picker_range["end"]:
+            raise ValueError("This hospital has no dates available for range selection.")
+        if selected_start < pd.Timestamp(picker_range["start"]):
+            raise ValueError("The selected range starts before this hospital's data.")
+        if selected_end > pd.Timestamp(picker_range["end"]):
+            raise ValueError("The selected range ends after this hospital's data.")
+    else:
+        selected_start, selected_end = min_date, max_date
 
-    frame = _cached_dataset_frame(
-        dataset_id, version
-    ).copy()
-    filtered = backend.apply_filters(frame, month=list(months), period=list(periods))
+    if start_date and end_date:
+        ranged = backend.filter_comparison_range(
+            frame, selected_start, selected_end
+        )
+    else:
+        ranged = frame.copy()
+    filtered = backend.apply_filters(
+        ranged, month=list(months), period=list(periods)
+    )
     kpis = backend.calculate_dashboard_metrics(
-        filtered, selected["hospital_name"]
+        filtered, hospital_name
     )
-    start, end = backend.data_date_range(frame)
-    monthly_target = backend.monthly_revenue_target(selected["hospital_name"])
-    target_by_period = _dashboard_target_by_period(
-        monthly_target, start, end, months, periods
-    )
+    occupancy_rows = filtered.copy()
+    if selected_start is not None and selected_end is not None:
+        doa_dates = pd.to_datetime(
+            occupancy_rows["DOA"], errors="coerce"
+        )
+        occupancy_rows.loc[
+            ~doa_dates.between(selected_start, selected_end).fillna(False), "DOA"
+        ] = pd.NaT
+    kpis["occupancy"] = backend.calculate_dashboard_metrics(
+        occupancy_rows, hospital_name
+    )["occupancy"]
+    monthly_target = backend.monthly_revenue_target(hospital_name)
+    if not start_date and min_date is None:
+        target_by_period = dict.fromkeys(backend.PERIOD_OPTIONS, 0.0)
+    elif not start_date:
+        target_start = (
+            pd.Timestamp(picker_range["start"])
+            if picker_range["start"] else min_date
+        )
+        target_end = (
+            pd.Timestamp(picker_range["end"])
+            if picker_range["end"] else max_date
+        )
+        target_by_period = _dashboard_target_by_period(
+            monthly_target, target_start, target_end, months, periods
+        )
+    else:
+        target_by_period = _dashboard_target_for_range(
+            monthly_target, selected_start, selected_end, months, periods
+        )
     kpis["target"] = sum(target_by_period.values())
     kpis["achievement"] = (
         kpis["revenue"] / kpis["target"] * 100 if kpis["target"] else 0
@@ -772,15 +1014,36 @@ def _get_dashboard_cached(dataset_id, months, periods, version):
         kpis["ipd_revenue"], kpis["bed_days"]
     )
     kpis["per_day_revenue"] = _ratio(
-        kpis["revenue"], _dashboard_selected_days(frame, months, periods)
+        kpis["revenue"], _dashboard_selected_days(ranged, months, periods)
     )
     return _json_value({
         "hasData": True,
-        "dataset": selected,
-        "dateRange": {"start": start, "end": end},
+        "dataset": selected_dataset or {
+                "hospital_name": hospital_name,
+                "source_file": "All saved data",
+                "dataset_id": database.raw_dataset_id(hospital_name),
+            },
+        "dateRange": {
+            "start": picker_range["start"],
+            "end": picker_range["end"],
+        },
+        "dateOptions": date_options,
+        "selectedRange": {
+            "start": (
+                selected_start.strftime("%Y-%m-%d")
+                if selected_start is not None else None
+            ),
+            "end": (
+                selected_end.strftime("%Y-%m-%d")
+                if selected_end is not None else None
+            ),
+        },
         "recordCount": len(filtered),
         "filters": {"month": list(months), "period": list(periods)},
-        "options": {"months": _month_names(frame), "periods": backend.PERIOD_OPTIONS},
+        "options": {
+            "months": _month_names(frame, today=picker_today),
+            "periods": backend.PERIOD_OPTIONS,
+        },
         "kpis": kpis,
         "charts": _dashboard_charts(
             filtered,
@@ -789,6 +1052,12 @@ def _get_dashboard_cached(dataset_id, months, periods, version):
             monthly_target=monthly_target,
             target_by_period=target_by_period,
             period_filter=periods,
+            yearly_trends=(
+                not selected_dataset
+                and not start_date
+                and not months
+                and not periods
+            ),
         ),
     })
 
@@ -1586,7 +1855,17 @@ def _comparison_period_breakdown(selected_hospital, filters, version):
             ]
 
     def merge_trend(name):
-        order, values = [], {}
+        period_mode = filters.get("compareBy") == "Period"
+        if period_mode:
+            month_start = pd.Timestamp(
+                int(filters["year"]),
+                pd.to_datetime(filters["month"], format="%B").month,
+                1,
+            )
+            order = [str(day) for day in range(1, month_start.days_in_month + 1)]
+        else:
+            order = []
+        values = {}
         title = ""
         for index, (_, result) in enumerate(results):
             if result is None:
@@ -1594,9 +1873,18 @@ def _comparison_period_breakdown(selected_hospital, filters, version):
             trend = (result.get("trends") or {}).get(name) or {}
             title = title or trend.get("title", "")
             for row in trend.get("rows", []):
-                if row["label"] not in order:
-                    order.append(row["label"])
-                values.setdefault(row["label"], {})[series_keys[index]] = row.get(
+                label = row["label"]
+                if period_mode:
+                    period_filter = {
+                        **filters,
+                        "period1": labels[index],
+                        "period2": labels[index],
+                    }
+                    start, _ = _comparison_target_range(period_filter, "1")
+                    label = str(start.day + int(label) - 1)
+                if label not in order:
+                    order.append(label)
+                values.setdefault(label, {})[series_keys[index]] = row.get(
                     "first", 0
                 )
         order.sort(key=lambda label: int(label) if str(label).isdigit() else 0)
@@ -1607,7 +1895,7 @@ def _comparison_period_breakdown(selected_hospital, filters, version):
                 {
                     "label": label,
                     **{
-                        key: values[label].get(key, 0)
+                        key: values.get(label, {}).get(key, 0)
                         for key in series_keys[:len(labels)]
                     },
                 }
@@ -1916,13 +2204,7 @@ def _get_comparison_cached(selected_hospital, serialized_filters, version):
             ),
         },
     }
-    period_days = [
-        (end - start).days + 1
-        for start, end in (
-            _comparison_target_range(filters, "1"),
-            _comparison_target_range(filters, "2"),
-        )
-    ]
+    period_days = _comparison_period_days(filters)
     chart_totals = _comparison_chart_totals(left_charts, right_charts)
     return _json_value({
         "hasData": True,
@@ -2120,7 +2402,7 @@ def export_comparison_csv(query):
     return frame.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
-def upload_excel(filename, file_bytes):
+def upload_excel(filename, file_bytes, hospital_name=None):
     if not filename or not filename.lower().endswith((".xlsx", ".xls")):
         raise ValueError("Upload an Excel workbook (.xlsx or .xls).")
     if not file_bytes:
@@ -2136,15 +2418,350 @@ def upload_excel(filename, file_bytes):
     if cleaned.empty:
         raise ValueError("The uploaded workbook contains no records.")
 
-    filename_lower = filename.casefold()
-    if "nimms" in filename_lower:
-        hospital_name = "NIMMS Hospital"
-    elif "surya" in filename_lower:
-        hospital_name = "Surya Hospital"
-    else:
-        hospital_name = "Default Hospital"
+    hospital_name = _hospital_for_upload(filename, hospital_name)
     result = database.save_hospital_data(
         cleaned, hospital_name, filename, file_bytes
     )
     result["hospital_name"] = hospital_name
     return result
+
+
+def _hospital_for_upload(filename, hospital_name=None):
+    if hospital_name is not None:
+        selected = str(hospital_name).strip()
+        if not selected:
+            raise ValueError("Choose a hospital for this upload.")
+        if len(selected) > 200:
+            raise ValueError("Hospital names cannot exceed 200 characters.")
+        return selected
+    filename_lower = filename.casefold()
+    if "nimms" in filename_lower:
+        return "NIMMS Hospital"
+    if "surya" in filename_lower:
+        return "Surya Hospital"
+    return "Default Hospital"
+
+
+def upload_files(files, hospital_name=None):
+    """Save merged workbooks through the existing path and rebuild raw reports."""
+    if not files:
+        raise ValueError("Choose at least one report to upload.")
+    if any(not file_bytes for _, file_bytes in files):
+        raise ValueError("One or more selected reports are empty.")
+
+    selected_hospital = _hospital_for_upload(files[0][0], hospital_name)
+    incoming_report = report_combiner.inspect_reports(files, include_frames=True)
+    raw_files = []
+    merged_files = []
+    merged_results = []
+    response_report = []
+
+    for (filename, file_bytes), entry in zip(files, incoming_report):
+        parsed_frame = entry.pop("_frame", None)
+        report_item = dict(entry)
+        if entry["detected_kind"] is not None:
+            raw_files.append({
+                "index": len(response_report),
+                "file_name": filename,
+                "file_bytes": file_bytes,
+                "kind": entry["detected_kind"],
+                "rows_read": entry["rows_read"],
+                "rows_used": 0,
+                "parsed_frame": parsed_frame,
+            })
+        elif _is_merged_workbook(filename, file_bytes, parsed_frame):
+            merged_files.append({
+                "filename": filename,
+                "file_bytes": file_bytes,
+                "report_item": report_item,
+            })
+        response_report.append(report_item)
+
+    raw_result = None
+    if raw_files:
+        raw_result = _upload_raw_reports(selected_hospital, raw_files, response_report)
+
+    for item in merged_files:
+        result = upload_excel(
+            item["filename"], item["file_bytes"], selected_hospital
+        )
+        merged_results.append(result)
+        item["report_item"]["detected_kind"] = "Merged"
+        item["report_item"]["rows_read"] = result["total"]
+        item["report_item"]["rows_used"] = result["inserted"]
+        item["report_item"]["message"] = (
+            "Saved through the existing merged-workbook upload path."
+            if result["inserted"] else "This merged workbook is already saved."
+        )
+
+    if not raw_result and not merged_results:
+        messages = [
+            f"{item['file_name']}: {item['message']}"
+            for item in response_report
+        ]
+        raise ValueError(
+            "No recognized raw reports or valid merged workbook were uploaded. "
+            + " ".join(messages)
+        )
+
+    inserted = sum(item["inserted"] for item in merged_results)
+    if raw_result and raw_result["new_upload_count"]:
+        inserted += raw_result["record_count"]
+    total = (
+        (raw_result["record_count"] if raw_result else 0)
+        + sum(item["total"] for item in merged_results)
+    )
+    dataset_id = (
+        raw_result["dataset_id"] if raw_result
+        else merged_results[-1]["dataset_id"]
+    )
+    public_raw_result = None
+    if raw_result:
+        public_raw_result = {
+            key: value for key, value in raw_result.items()
+            if key not in {"report_uploads", "included_uploads"}
+        }
+    return {
+        "inserted": inserted,
+        "total": total,
+        "duplicate": (
+            raw_result["new_upload_count"] == 0
+            and all(item["duplicate"] for item in merged_results)
+            if raw_result
+            else all(item["duplicate"] for item in merged_results)
+        ),
+        "dataset_id": dataset_id,
+        "hospital_name": selected_hospital,
+        "upload_hash": raw_result["combined_hash"] if raw_result else (
+            merged_results[-1]["upload_hash"]
+        ),
+        "report": response_report,
+        "raw_dataset": public_raw_result,
+        "merged_uploads": merged_results,
+    }
+
+
+def _is_merged_workbook(filename, file_bytes, parsed_frame=None):
+    if Path(filename).suffix.casefold() not in {".xlsx", ".xls"}:
+        return False
+    if parsed_frame is None:
+        try:
+            parsed_frame = report_combiner.read_raw_file(filename, file_bytes)
+        except ValueError:
+            return False
+    cleaned = backend.clean_data(parsed_frame.copy())
+    required = {"Type", "DOA", "DOD", "Dept. Name", "Doctor Name", "Panel Name"}
+    return required.issubset(cleaned.columns) and not backend.validate_columns(cleaned)
+
+
+def _combined_report_hash(hospital_name, uploads):
+    payload = json.dumps({
+        "hospital": hospital_name.strip().casefold(),
+        "reports": sorted(item["content_hash"] for item in uploads),
+    }, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def rebuild_hospital_raw_reports(
+    hospital_name,
+    *,
+    uploads_to_add=(),
+    upload_to_delete=None,
+    include_change=None,
+    parsed_frames=None,
+):
+    if upload_to_delete and include_change is not None:
+        raise ValueError("A report upload cannot be deleted and toggled together.")
+    selected_hospital = _hospital_for_upload("", hospital_name)
+    with _REPORT_UPLOAD_LOCK:
+        existing_uploads = database.load_report_uploads(
+            selected_hospital, included_only=False
+        )
+        deleted_ids = {upload_to_delete} if upload_to_delete else set()
+        proposed = [
+            item for item in existing_uploads
+            if item["upload_id"] not in deleted_ids
+        ]
+        if include_change is not None:
+            target_id, included = include_change
+            target = next(
+                (item for item in proposed if item["upload_id"] == target_id),
+                None,
+            )
+            if target is None:
+                raise ValueError("The selected report upload is not available.")
+            target["included"] = bool(included)
+
+        new_uploads = list(uploads_to_add)
+        known_hashes = {item["content_hash"] for item in proposed}
+        staged = []
+        for item in new_uploads:
+            content_hash = hashlib.sha256(item["file_bytes"]).hexdigest()
+            if content_hash in known_hashes:
+                continue
+            known_hashes.add(content_hash)
+            staged.append({
+                **item,
+                "content_hash": content_hash,
+                "included": True,
+                "upload_id": None,
+            })
+        proposed.extend(staged)
+
+        included_uploads = [item for item in proposed if item["included"]]
+        merged_frame, combined_report = report_combiner.combine_reports([
+            (item["file_name"], item["file_bytes"])
+            for item in included_uploads
+        ], parsed_frames=parsed_frames)
+        report_stats = []
+        staged_by_hash = {item["content_hash"]: item for item in staged}
+        for item, result in zip(included_uploads, combined_report):
+            item["rows_read"] = result["rows_read"]
+            item["rows_used"] = result["rows_used"]
+            if item["upload_id"] is not None:
+                report_stats.append({
+                    "upload_id": item["upload_id"],
+                    "rows_read": result["rows_read"],
+                    "rows_used": result["rows_used"],
+                })
+            else:
+                staged_by_hash[item["content_hash"]]["rows_read"] = result["rows_read"]
+                staged_by_hash[item["content_hash"]]["rows_used"] = result["rows_used"]
+
+        for item in proposed:
+            if not item["included"] and item["upload_id"] is not None:
+                report_stats.append({
+                    "upload_id": item["upload_id"],
+                    "rows_read": item["rows_read"],
+                    "rows_used": 0,
+                })
+
+        combined_hash = _combined_report_hash(selected_hospital, included_uploads)
+        result = database.commit_report_upload_changes(
+            selected_hospital,
+            merged_frame,
+            combined_hash,
+            uploads_to_add=staged,
+            upload_to_delete=upload_to_delete,
+            include_change=include_change,
+            report_stats=report_stats,
+        )
+        result["combined_hash"] = combined_hash
+        result["new_upload_count"] = sum(
+            not item["duplicate"] for item in result["uploads"]
+        )
+        result["report"] = combined_report
+        result["report_uploads"] = proposed
+        result["included_uploads"] = included_uploads
+        _invalidate_data_caches()
+        return result
+
+
+def _upload_raw_reports(hospital_name, incoming_files, response_report):
+    with _REPORT_UPLOAD_LOCK:
+        existing_uploads = database.load_report_uploads(
+            hospital_name, included_only=False
+        )
+        known_hashes = {item["content_hash"] for item in existing_uploads}
+        new_uploads = []
+        parsed_frames = {}
+        for item in incoming_files:
+            content_hash = hashlib.sha256(item["file_bytes"]).hexdigest()
+            if content_hash in known_hashes:
+                response_report[item["index"]]["rows_used"] = 0
+                response_report[item["index"]]["message"] = (
+                    "This report's content is already uploaded and was skipped."
+                )
+                continue
+            known_hashes.add(content_hash)
+            new_uploads.append(item)
+            if item["parsed_frame"] is not None:
+                parsed_frames[content_hash] = item["parsed_frame"]
+
+        if not new_uploads:
+            dataset_id = database.raw_dataset_id(hospital_name)
+            dataset = next(
+                (
+                    item for item in _dataset_metadata()
+                    if item["dataset_id"] == dataset_id
+                ),
+                None,
+            )
+            return {
+                "dataset_id": dataset_id,
+                "record_count": dataset["record_count"] if dataset else 0,
+                "new_upload_count": 0,
+                "combined_hash": _combined_report_hash(
+                    hospital_name,
+                    [item for item in existing_uploads if item["included"]],
+                ),
+                "report": [],
+            }
+
+        result = rebuild_hospital_raw_reports(
+            hospital_name,
+            uploads_to_add=new_uploads,
+            parsed_frames=parsed_frames,
+        )
+        report_by_hash = {
+            upload["content_hash"]: report_item
+            for upload, report_item in zip(
+                result["included_uploads"], result["report"]
+            )
+        }
+        for item in new_uploads:
+            content_hash = hashlib.sha256(item["file_bytes"]).hexdigest()
+            matching = report_by_hash.get(content_hash)
+            if matching is not None:
+                target = response_report[item["index"]]
+                target["rows_used"] = matching["rows_used"]
+                target["message"] = matching["message"]
+
+        result["report"] = response_report
+        return result
+
+
+def list_report_uploads(hospital_name):
+    return database.list_report_uploads(
+        _hospital_for_upload("", hospital_name)
+    )
+
+
+def delete_report_upload(upload_id):
+    upload = database.get_report_upload(upload_id)
+    result = rebuild_hospital_raw_reports(
+        upload["hospital_name"],
+        upload_to_delete=upload_id,
+    )
+    return _public_rebuild_result(result)
+
+
+def set_report_upload_included(upload_id, included):
+    if not isinstance(included, bool):
+        raise ValueError("The included value must be true or false.")
+    upload = database.get_report_upload(upload_id)
+    result = rebuild_hospital_raw_reports(
+        upload["hospital_name"],
+        include_change=(upload_id, included),
+    )
+    return _public_rebuild_result(result)
+
+
+def _public_rebuild_result(result):
+    return {
+        key: value for key, value in result.items()
+        if key not in {"report_uploads", "included_uploads"}
+    }
+
+
+def _invalidate_data_caches():
+    for cache in (
+        _cached_dataset_metadata,
+        _cached_dataset_frame,
+        _cached_hospital_frame,
+        _cached_master_frame,
+        _get_dashboard_cached,
+        _cached_comparison_options,
+        _get_comparison_cached,
+    ):
+        cache.cache_clear()

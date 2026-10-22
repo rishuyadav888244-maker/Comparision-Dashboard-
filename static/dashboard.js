@@ -15,6 +15,7 @@ const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
+const DASHBOARD_HOSPITALS = ["NIMMS Hospital", "Surya Hospital"];
 const COMPARISON_SERIES_KEYS = ["first", "second", "third"];
 const DASHBOARD_CATEGORY_MAX_ROWS = 15;
 const DASHBOARD_CATEGORY_ROW_HEIGHT = 28;
@@ -23,11 +24,14 @@ const state = {
   options: null,
   dashboard: null,
   toastTimer: null,
+  chartFrame: 0,
   charts: [],
   comparisonMoverMetric: "ipdRevenue",
   comparisonMoverDimension: "departments",
   comparisonView: "numbers",
   comparisonLoading: false,
+  appliedRange: null,
+  rangeHospital: null,
 };
 
 function money(value) {
@@ -83,13 +87,15 @@ function addOptions(select, values, { placeholder = null, selected = null } = {}
     empty.textContent = placeholder;
     select.append(empty);
   }
+  const selectedValue = selected == null ? null : String(selected);
   values.forEach((entry) => {
     const option = document.createElement("option");
-    option.value = String(typeof entry === "object" ? entry.value : entry);
+    const optionValue = String(typeof entry === "object" ? entry.value : entry);
+    option.value = optionValue;
     option.textContent = String(typeof entry === "object" ? entry.label : entry);
     option.selected = Array.isArray(selected)
-      ? selected.includes(option.value)
-      : selected !== null && selected === option.value;
+      ? selected.map(String).includes(optionValue)
+      : selectedValue !== null && selectedValue === optionValue;
     select.append(option);
   });
   if (select.multiple) renderMultiSelect(select);
@@ -180,14 +186,11 @@ function selectedValues(select) {
 
 function selectedFilters() {
   return {
-    datasetId: $("#dataset-select").value,
-    month: selectedValues($("#month-select")),
-    period: selectedValues($("#period-select")),
+    hospital: $("#hospital-select").value,
+    month: [],
+    period: [],
+    range: state.appliedRange,
   };
-}
-
-function formatDataset(item) {
-  return `${item.hospital_name} · ${item.source_file} (${number(item.record_count)} rows)`;
 }
 
 function setView(name) {
@@ -223,9 +226,13 @@ function updatePrintContext() {
   if (activeView === "overview") {
     addLine("Dashboard", "Overview");
     const dashboard = state.dashboard;
-    addLine("Dataset", dashboard?.dataset
-      ? `${dashboard.dataset.hospital_name} · ${dashboard.dataset.source_file}`
-      : $("#dataset-select")?.selectedOptions[0]?.textContent);
+    addLine("Hospital", dashboard?.dataset?.hospital_name || $("#hospital-select")?.value);
+    if (dashboard?.selectedRange) {
+      addLine(
+        "Date range",
+        `${dateText(dashboard.selectedRange.start)} – ${dateText(dashboard.selectedRange.end)}`,
+      );
+    }
     addLine("Month filter", dashboard?.filters?.month?.join(", ") || "All months");
     addLine("Period filter", dashboard?.filters?.period?.join(", ") || "All periods");
   } else {
@@ -281,7 +288,7 @@ async function downloadInteractiveHtml() {
     toast(error.message, true);
   } finally {
     button.disabled = false;
-    button.textContent = "Download interactive HTML";
+    button.textContent = "Offline HTML";
   }
 }
 
@@ -289,15 +296,15 @@ async function initialize() {
   try {
     const options = await request("/api/options");
     state.options = options;
-    addOptions($("#dataset-select"), options.datasets.map((item) => ({
-      value: item.dataset_id,
-      label: formatDataset(item),
-    })), { selected: options.defaultDatasetId });
-    addOptions($("#month-select"), options.months || []);
-    addOptions($("#period-select"), options.periods || PERIODS);
-    bindMultiSelect("month-select");
-    bindMultiSelect("period-select");
-    addOptions($("#comparison-hospital"), ["All Hospitals", ...(options.hospitals || [])], {
+    $("#upload-management").open = false;
+    const hospitalOptions = DASHBOARD_HOSPITALS;
+    addOptions($("#hospital-select"), ["All Hospitals", ...hospitalOptions], {
+      selected: "All Hospitals",
+    });
+    addOptions($("#upload-hospital-select"), DASHBOARD_HOSPITALS, {
+      selected: "NIMMS Hospital",
+    });
+    addOptions($("#comparison-hospital"), ["All Hospitals", ...hospitalOptions], {
       selected: "All Hospitals",
     });
     $("#date-range").textContent = options.dateRange
@@ -306,7 +313,10 @@ async function initialize() {
     state.comparisonOptionsLoaded = Array.isArray(options.comparison?.years);
     createComparisonFields();
     bindEvents();
-    if (options.datasets.length) await loadDashboard();
+    await loadUploads();
+    if (options.datasets.length) {
+      await loadDashboard();
+    }
     else renderNoData();
   } catch (error) {
     toast(error.message, true);
@@ -314,44 +324,47 @@ async function initialize() {
 }
 
 function bindEvents() {
-  $("#apply-filters").addEventListener("click", () => loadDashboard());
-  $("#dataset-select").addEventListener("change", async () => {
-    const dataset = state.options.datasets.find((item) => item.dataset_id === $("#dataset-select").value);
-    if (dataset) {
-      try {
-        const response = await request(`/api/dashboard?datasetId=${encodeURIComponent(dataset.dataset_id)}`);
-        addOptions($("#month-select"), response.options.months || []);
-      } catch (error) {
-        toast(error.message, true);
-      }
+  $("#hospital-select").addEventListener("change", async () => {
+    state.appliedRange = null;
+    state.rangeHospital = null;
+    $("#range-type").value = "Full Range";
+    updateRangeControlVisibility();
+    if ($("#hospital-select").value !== "All Hospitals") {
+      $("#upload-hospital-select").value = $("#hospital-select").value;
     }
+    await loadUploads();
     await loadDashboard();
   });
-  $("#clear-filters").addEventListener("click", () => {
-    $("#month-select").selectedIndex = -1;
-    $("#period-select").selectedIndex = -1;
-    updateMultiSelect($("#month-select"));
-    updateMultiSelect($("#period-select"));
-    loadDashboard();
+  $("#upload-hospital-select").addEventListener("change", loadUploads);
+  $("#range-type").addEventListener("change", updateRangeControlVisibility);
+  $("#range-month-year-select").addEventListener("change", () => {
+    updateMonthSelect(
+      $("#range-month-year-select"),
+      $("#range-month-select"),
+      state.dashboard?.dateOptions?.monthsByYear || [],
+    );
   });
-  document.addEventListener("click", (event) => {
-    document.querySelectorAll(".multi-select").forEach((widget) => {
-      if (widget.contains(event.target)) return;
-      const menu = widget.querySelector(".multi-select-menu");
-      menu.hidden = true;
-      widget.querySelector(".multi-select-trigger").setAttribute("aria-expanded", "false");
-    });
+  $("#range-period-year-select").addEventListener("change", () => {
+    updateMonthSelect(
+      $("#range-period-year-select"),
+      $("#range-period-month-select"),
+      state.dashboard?.dateOptions?.monthsByYear || [],
+    );
   });
-  $("#refresh-data").addEventListener("click", () => refreshOptions($("#dataset-select").value));
+  $("#apply-range").addEventListener("click", applyDateRange);
+  $("#clear-filters").addEventListener("click", clearDashboardFilters);
+  $("#refresh-data").addEventListener("click", () => refreshOptions(
+    $("#hospital-select").value,
+  ));
   $("#export-button").addEventListener("click", exportCsv);
-  $("#delete-dataset").addEventListener("click", deleteDataset);
   $("#print-button").addEventListener("click", () => {
     updatePrintContext();
     window.print();
   });
   window.addEventListener("beforeprint", updatePrintContext);
   $("#download-interactive").addEventListener("click", downloadInteractiveHtml);
-  $("#upload-file").addEventListener("change", uploadWorkbook);
+  $("#upload-files").addEventListener("change", uploadReports);
+  $("#upload-list").addEventListener("click", manageReportUpload);
   document.querySelectorAll(".view-tab").forEach((button) => {
     button.addEventListener("click", () => setView(button.dataset.view));
   });
@@ -416,33 +429,410 @@ function bindEvents() {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") hideComparisonTip();
   });
+  if ("ResizeObserver" in window) {
+    const chartResizeObserver = new ResizeObserver(() => {
+      scheduleCharts();
+      scheduleComparisonChart();
+      window.dispatchEvent(new Event("dashboard-chart-resize"));
+    });
+    document.querySelectorAll(".chart-wrap").forEach((chart) => {
+      chartResizeObserver.observe(chart);
+    });
+  }
   window.addEventListener("resize", scheduleCharts);
+}
+
+function updateRangeControlVisibility() {
+  const type = $("#range-type").value;
+  $("#range-controls").dataset.rangeType = type;
+  const custom = type === "Custom From-To";
+  $("#range-year-field").hidden = type !== "Year";
+  $("#range-month-year-field").hidden = type !== "Month";
+  $("#range-month-field").hidden = type !== "Month";
+  $("#range-period-year-field").hidden = type !== "Period";
+  $("#range-period-month-field").hidden = type !== "Period";
+  $("#range-period-field").hidden = type !== "Period";
+  $("#range-anchor-field").hidden = !["Week", "Day"].includes(type);
+  $("#range-from-field").hidden = !custom;
+  $("#range-to-field").hidden = !custom;
+  const hasData = state.dashboard?.hasData;
+  const hasBounds = Boolean(
+    state.dashboard?.dateRange?.start && state.dashboard?.dateRange?.end,
+  );
+  $("#apply-range").disabled = !hasData || (type !== "Full Range" && !hasBounds);
+}
+
+function updateMonthSelect(yearSelect, monthSelect, monthsByYear, selectedMonth) {
+  const year = Number(yearSelect.value);
+  const available = monthsByYear.find((entry) => entry.year === year)?.months || [];
+  addOptions(monthSelect, available, {
+    selected: available.some((entry) => String(entry.value) === String(selectedMonth))
+      ? String(selectedMonth)
+      : available[0]?.value,
+  });
+}
+
+function updateRangeDateOptions(dateOptions, saved = null) {
+  const options = dateOptions || { years: [], monthsByYear: [] };
+  const years = (options.years || []).map((year) => Number(year)).filter(Number.isFinite);
+  [
+    "#range-year-select",
+    "#range-month-year-select",
+    "#range-period-year-select",
+  ].forEach((selector) => {
+    const select = $(selector);
+    const requestedYear = selector === "#range-year-select"
+      ? saved?.year
+      : selector === "#range-month-year-select"
+        ? saved?.monthYear
+        : saved?.periodYear;
+    const selected = years.includes(Number(requestedYear))
+      ? Number(requestedYear)
+      : years.length
+        ? years[years.length - 1]
+        : null;
+    addOptions(select, years, { selected });
+    select.disabled = years.length === 0;
+  });
+  updateMonthSelect(
+    $("#range-month-year-select"),
+    $("#range-month-select"),
+    options.monthsByYear || [],
+    saved?.month,
+  );
+  updateMonthSelect(
+    $("#range-period-year-select"),
+    $("#range-period-month-select"),
+    options.monthsByYear || [],
+    saved?.periodMonth,
+  );
+  $("#range-period-select").disabled = years.length === 0;
+  addOptions($("#range-period-select"), PERIODS, {
+    selected: PERIODS.includes(saved?.period) ? saved.period : PERIODS[0],
+  });
+}
+
+function setRangeInputBounds(dateRange) {
+  const minDate = dateRange?.start || "";
+  const maxDate = dateRange?.end || "";
+  const disabled = !minDate || !maxDate;
+  ["#range-anchor", "#range-from", "#range-to"].forEach((selector) => {
+    const input = $(selector);
+    input.min = minDate;
+    input.max = maxDate;
+    input.disabled = disabled;
+  });
+}
+
+function initializeRangeControls(data) {
+  const hospital = data.dataset?.hospital_name;
+  if (!hospital) return false;
+  setRangeInputBounds(data.dateRange);
+  if (state.rangeHospital === hospital) {
+    updateRangeDateOptions(data.dateOptions, {
+      year: $("#range-year-select").value,
+      monthYear: $("#range-month-year-select").value,
+      month: $("#range-month-select").value,
+      periodYear: $("#range-period-year-select").value,
+      periodMonth: $("#range-period-month-select").value,
+      period: $("#range-period-select").value,
+    });
+    return false;
+  }
+  state.rangeHospital = hospital;
+  const minDate = data.dateRange?.start;
+  const maxDate = data.dateRange?.end;
+  state.appliedRange = null;
+  $("#range-type").value = "Full Range";
+  updateRangeDateOptions(data.dateOptions);
+  $("#range-anchor").value = maxDate || "";
+  $("#range-from").value = minDate || "";
+  $("#range-to").value = maxDate || "";
+  updateRangeControlVisibility();
+  return false;
+}
+
+function clampDate(value, minDate, maxDate) {
+  return value < minDate ? minDate : value > maxDate ? maxDate : value;
+}
+
+function addDays(dateValue, days) {
+  const date = new Date(`${dateValue}T00:00:00`);
+  date.setDate(date.getDate() + days);
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function calculateDateRange(type, bounds) {
+  const { start: minDate, end: maxDate } = bounds;
+  if (type === "Custom From-To") {
+    const start = $("#range-from").value;
+    const end = $("#range-to").value;
+    if (!start || !end || start < minDate || end > maxDate || start > end) {
+      throw new Error("Choose a valid custom range within the available dates.");
+    }
+    return { start, end };
+  }
+  if (type === "Year") {
+    const year = $("#range-year-select").value;
+    if (!year) throw new Error("Choose a year with available data.");
+    return {
+      start: clampDate(`${year}-01-01`, minDate, maxDate),
+      end: clampDate(`${year}-12-31`, minDate, maxDate),
+    };
+  }
+  if (type === "Month") {
+    const year = $("#range-month-year-select").value;
+    const month = $("#range-month-select").value;
+    if (!year || !month) throw new Error("Choose a month with available data.");
+    const monthText = String(month).padStart(2, "0");
+    const monthStart = `${year}-${monthText}-01`;
+    const lastDay = new Date(
+      Number(year), Number(month), 0,
+    ).getDate();
+    const monthEnd = `${year}-${monthText}-${String(lastDay).padStart(2, "0")}`;
+    return {
+      start: clampDate(monthStart, minDate, maxDate),
+      end: clampDate(monthEnd, minDate, maxDate),
+    };
+  }
+  if (type === "Period") {
+    const year = $("#range-period-year-select").value;
+    const month = $("#range-period-month-select").value;
+    const period = $("#range-period-select").value;
+    if (!year || !month || !period) {
+      throw new Error("Choose a month and period with available data.");
+    }
+    const monthText = String(month).padStart(2, "0");
+    const lastDay = new Date(Number(year), Number(month), 0).getDate();
+    const firstDay = period === PERIODS[0] ? 1 : period === PERIODS[1] ? 11 : 21;
+    const finalDay = period === PERIODS[0] ? 10 : period === PERIODS[1] ? 20 : lastDay;
+    return {
+      start: clampDate(`${year}-${monthText}-${String(firstDay).padStart(2, "0")}`, minDate, maxDate),
+      end: clampDate(`${year}-${monthText}-${String(finalDay).padStart(2, "0")}`, minDate, maxDate),
+    };
+  }
+  const anchor = $("#range-anchor").value;
+  if (!anchor || anchor < minDate || anchor > maxDate) {
+    throw new Error("Choose a date within the available data range.");
+  }
+  if (type === "Week") {
+    const weekday = new Date(`${anchor}T00:00:00`).getDay();
+    const mondayOffset = (weekday + 6) % 7;
+    return {
+      start: clampDate(addDays(anchor, -mondayOffset), minDate, maxDate),
+      end: clampDate(addDays(anchor, 6 - mondayOffset), minDate, maxDate),
+    };
+  }
+  return { start: anchor, end: anchor };
+}
+
+async function applyDateRange() {
+  const hospital = $("#hospital-select").value;
+  const bounds = state.dashboard?.dateRange;
+  const type = $("#range-type").value;
+  if (!hospital || (type !== "Full Range" && (!bounds?.start || !bounds?.end))) {
+    toast("There are no hospital dates available to select.", true);
+    return;
+  }
+  try {
+    const range = type === "Full Range" ? null : calculateDateRange(type, bounds);
+    state.appliedRange = range;
+    await loadDashboard();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function clearDashboardFilters() {
+  $("#range-type").value = "Full Range";
+  state.appliedRange = null;
+  const bounds = state.dashboard?.dateRange;
+  $("#range-from").value = bounds?.start || "";
+  $("#range-to").value = bounds?.end || "";
+  $("#range-anchor").value = bounds?.end || "";
+  updateRangeControlVisibility();
+  await loadDashboard();
+}
+
+function renderUploadList(uploads) {
+  const list = $("#upload-list");
+  list.replaceChildren();
+  if (!uploads.length) {
+    const empty = document.createElement("p");
+    empty.className = "upload-list-empty";
+    empty.textContent = "No raw reports uploaded for this hospital.";
+    list.append(empty);
+    return;
+  }
+  uploads.forEach((upload) => {
+    const row = document.createElement("div");
+    row.className = "upload-list-row";
+    const description = document.createElement("span");
+    description.className = "upload-list-description";
+    description.textContent = `${upload.file_name} · ${upload.kind} · ${number(upload.rows_used)} rows used · ${upload.included ? "included" : "excluded"}`;
+    const actions = document.createElement("span");
+    actions.className = "upload-list-actions";
+    const toggle = document.createElement("button");
+    toggle.className = "button button-secondary";
+    toggle.type = "button";
+    toggle.dataset.action = "toggle";
+    toggle.dataset.uploadId = upload.upload_id;
+    toggle.dataset.included = String(upload.included);
+    toggle.textContent = upload.included ? "Exclude" : "Include";
+    const remove = document.createElement("button");
+    remove.className = "button button-secondary";
+    remove.type = "button";
+    remove.dataset.action = "delete";
+    remove.dataset.uploadId = upload.upload_id;
+    remove.textContent = "Delete";
+    actions.append(toggle, remove);
+    row.append(description, actions);
+    list.append(row);
+  });
+}
+
+async function loadUploads() {
+  const hospital = $("#upload-hospital-select").value;
+  if (!hospital) {
+    renderUploadList([]);
+    $("#upload-summary-count").textContent = "0 reports";
+    return;
+  }
+  try {
+    const result = await request(`/api/uploads?hospitalName=${encodeURIComponent(hospital)}`);
+    renderUploadList(result.uploads || []);
+    $("#upload-summary-count").textContent =
+      `${number((result.uploads || []).length)} reports`;
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function manageReportUpload(event) {
+  const button = event.target.closest("button[data-upload-id]");
+  if (!button) return;
+  const uploadId = button.dataset.uploadId;
+  try {
+    if (button.dataset.action === "delete") {
+      if (!window.confirm("Permanently delete this uploaded report?")) return;
+      await request("/api/uploads/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uploadId }),
+      });
+      toast("Report deleted and hospital data rebuilt.");
+    } else {
+      await request("/api/uploads/include", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          uploadId,
+          included: button.dataset.included !== "true",
+        }),
+      });
+      toast("Report inclusion updated and hospital data rebuilt.");
+    }
+    await refreshOptions($("#hospital-select").value);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function uploadReports() {
+  const input = $("#upload-files");
+  if (input.disabled) return;
+  const files = [...input.files];
+  if (!files.length) return;
+  if (files.some((file) => file.size > 25 * 1024 * 1024)) {
+    toast("Each selected file must be no larger than 25 MB.", true);
+    input.value = "";
+    return;
+  }
+  if (files.reduce((total, file) => total + file.size, 0) > 79 * 1024 * 1024) {
+    toast("The selected files exceed the 80 MB total request limit.", true);
+    input.value = "";
+    return;
+  }
+  const hospitalName = $("#upload-hospital-select").value;
+  if (!hospitalName) {
+    toast("Choose a hospital before uploading.", true);
+    return;
+  }
+  const form = new FormData();
+  files.forEach((file) => form.append("file", file));
+  form.append("hospitalName", hospitalName);
+  const hospitalSelect = $("#upload-hospital-select");
+  const status = $("#upload-status");
+  input.disabled = true;
+  hospitalSelect.disabled = true;
+  status.textContent = `Uploading ${files.length} file${files.length === 1 ? "" : "s"}…`;
+  try {
+    const response = await request("/api/upload", { method: "POST", body: form });
+    toast(response.upload.inserted
+      ? `Saved ${number(response.upload.inserted)} records for ${hospitalName}.`
+      : "The selected reports were already saved.");
+    status.textContent = "Refreshing dashboard…";
+    await refreshOptions(hospitalName);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    input.disabled = false;
+    hospitalSelect.disabled = false;
+    input.value = "";
+    status.textContent = "";
+  }
 }
 
 async function loadDashboard() {
   const filters = selectedFilters();
-  if (!filters.datasetId) {
+  if (!filters.hospital) {
     renderNoData();
     return;
   }
-  $("#apply-filters").disabled = true;
+  $("#apply-range").disabled = true;
   try {
-    const query = new URLSearchParams({ datasetId: filters.datasetId });
+    const query = new URLSearchParams({ hospital: filters.hospital });
+    if (filters.range?.start && filters.range?.end) {
+      query.set("startDate", filters.range.start);
+      query.set("endDate", filters.range.end);
+    }
     filters.month.forEach((month) => query.append("month", month));
     filters.period.forEach((period) => query.append("period", period));
     const data = await request(`/api/dashboard?${query.toString()}`);
+    const restoreRange = initializeRangeControls(data);
     state.dashboard = data;
     renderDashboard(data);
+    if (restoreRange) await loadDashboard();
   } catch (error) {
     toast(error.message, true);
   } finally {
-    $("#apply-filters").disabled = false;
+    updateRangeControlVisibility();
   }
 }
 
 function renderNoData() {
   $("#kpi-grid").replaceChildren();
+  renderKpis({
+    admissions: 0,
+    discharges: 0,
+    opd_consultation: 0,
+    revenue: 0,
+    ipd_revenue: 0,
+    opd_revenue: 0,
+    cash_due: 0,
+    credit_due: 0,
+    alos: 0,
+    arpp: 0,
+    per_day_patient_charge: 0,
+    per_day_revenue: 0,
+  });
   $("#date-range").textContent = "No saved hospital data";
+  $("#no-data-in-range").hidden = !state.appliedRange;
+  setRangeInputBounds(null);
 }
 
 function renderDashboard(data) {
@@ -450,7 +840,17 @@ function renderDashboard(data) {
     renderNoData();
     return;
   }
+  updateRangeControlVisibility();
+  $("#no-data-in-range").hidden = data.recordCount !== 0 || !state.appliedRange;
   updateHeaderDateRange();
+  const yearly = data.charts.granularity === "yearly";
+  [
+    ["#revenue-chart", yearly ? "IPD revenue by year" : "IPD revenue trend"],
+    ["#flow-chart", yearly ? "Patient flow by year" : "Patient flow"],
+    ["#opd-trend-chart", yearly ? "OPD consultation trend by year" : "OPD consultation trend"],
+  ].forEach(([selector, title]) => {
+    $(selector).closest(".chart-card").querySelector(".chart-heading h3").textContent = title;
+  });
   renderKpis(data.kpis);
   renderInsights(data.charts.insights, data.charts, data.kpis);
   drawDashboardCharts(data.charts);
@@ -665,34 +1065,27 @@ function drawDashboardCharts(charts) {
   horizontalCharts.forEach(({ canvas, rows, options }) => {
     drawBars(canvas, rows, { ...options, layoutHeight: sharedChartHeight });
   });
-  const showFilteredDailyValues = (canvas, rows) =>
-    Boolean(state.dashboard?.filters?.month?.length)
-    && charts.granularity !== "monthly"
-    && rows?.length > 0
-    && canvas.clientWidth / rows.length >= 18;
-  const showAllRevenueValues = charts.granularity === "monthly"
-    || showFilteredDailyValues($("#revenue-chart"), charts.revenueTrend);
+  ["#revenue-chart", "#flow-chart", "#opd-trend-chart"].forEach((selector) => {
+    $(selector).style.width = "";
+    $(selector).style.height = "";
+  });
   drawBars($("#revenue-chart"), charts.revenueTrend, {
     color: COLORS.teal, formatter: compactMoney, mode: "line",
-    showAllValueLabels: showAllRevenueValues,
-    showPercentLabels: !showAllRevenueValues || charts.granularity === "monthly",
+    showAllValueLabels: true,
+    showPercentLabels: false,
     total: totals.revenueTrend,
   });
-  const showAllFlowValues = charts.granularity === "monthly"
-    || showFilteredDailyValues($("#flow-chart"), charts.patientFlow);
   drawGroupedBars($("#flow-chart"), charts.patientFlow, [
     { key: "Admissions", label: "Admissions", color: COLORS.teal },
     { key: "Discharges", label: "Discharges", color: COLORS.blue },
   ], totals.patientFlow, {
-    showAllValueLabels: showAllFlowValues,
+    showAllValueLabels: true,
     showPercent: false,
   });
-  const showAllOpdValues = charts.granularity === "monthly"
-    || showFilteredDailyValues($("#opd-trend-chart"), charts.opdDaily);
   drawBars($("#opd-trend-chart"), charts.opdDaily, {
     color: COLORS.teal, mode: "line",
-    showAllValueLabels: showAllOpdValues,
-    showPercentLabels: !showAllOpdValues || charts.granularity === "monthly",
+    showAllValueLabels: true,
+    showPercentLabels: false,
     total: totals.opdDaily,
   });
   drawTargetProgress(totals.targetProgress);
@@ -715,13 +1108,18 @@ function compactDashboardChartRows(rows) {
 function drawTargetProgress(totals = {}) {
   const actual = Number(totals.actual || 0);
   const target = Number(totals.target || 0);
+  const monthlyTarget = Number(totals.monthlyTarget || 0);
+  const remaining = Math.max(0, target - actual);
   const achievement = target > 0 ? actual / target * 100 : 0;
   const progress = Math.min(100, Math.max(0, achievement));
   const ring = $("#target-progress-ring");
   const circumference = 2 * Math.PI * 86;
 
   $("#target-progress-target").textContent = compactMoney(target);
+  $("#target-progress-monthly").textContent =
+    `Monthly target: ${compactMoney(monthlyTarget)}`;
   $("#target-progress-actual").textContent = compactMoney(actual);
+  $("#target-progress-remaining").textContent = compactMoney(remaining);
   $("#target-progress-value").textContent = `${achievement.toFixed(1)}%`;
   $("#target-progress-arc").setAttribute(
     "stroke-dasharray", `${circumference * progress / 100} ${circumference}`,
@@ -881,7 +1279,12 @@ function drawBars(canvas, rows, options = {}) {
     }]);
     return;
   }
-  const margin = { top: 34, right: 15, bottom: 38, left: 50 };
+  const margin = {
+    top: options.showAllValueLabels ? 62 : 34,
+    right: 15,
+    bottom: 38,
+    left: 50,
+  };
   const chartWidth = width - margin.left - margin.right;
   const chartHeight = height - margin.top - margin.bottom;
   const values = rows.map((row) => Number(row.value || 0));
@@ -929,7 +1332,7 @@ function drawBars(canvas, rows, options = {}) {
             ctx,
             (options.formatter || number)(value),
             centerX,
-            y - 7 - (index % 2) * 12,
+            y - 7 - (index % 3) * 12,
             changeColor(value, previousValue),
           );
         } else {
@@ -968,7 +1371,7 @@ function drawBars(canvas, rows, options = {}) {
     }
     ctx.fillStyle = COLORS.muted;
     ctx.textAlign = "center";
-    if (options.showAllValueLabels || labelPlan.showAxisLabel(index)) {
+    if (options.showAllAxisLabels || labelPlan.showAxisLabel(index)) {
       ctx.font = PERIODS.includes(String(row.label || ""))
         ? "bold 10px Segoe UI, Arial"
         : "10px Segoe UI, Arial";
@@ -1190,7 +1593,7 @@ function drawGroupedBars(canvas, rows, series, totals = {}, options = {}) {
     });
     ctx.fillStyle = COLORS.muted;
     ctx.textAlign = "center";
-    if (options.showAllValueLabels || labelPlan.showAxisLabel(index)) {
+    if (options.showAllAxisLabels || labelPlan.showAxisLabel(index)) {
       ctx.font = PERIODS.includes(String(row.label || ""))
         ? "bold 10px Segoe UI, Arial"
         : "10px Segoe UI, Arial";
@@ -1259,8 +1662,11 @@ function drawEmpty(ctx, width, height) {
 }
 
 function scheduleCharts() {
-  if (!state.dashboard) return;
-  window.requestAnimationFrame(() => drawDashboardCharts(state.dashboard.charts));
+  if (!state.dashboard || state.chartFrame) return;
+  state.chartFrame = window.requestAnimationFrame(() => {
+    state.chartFrame = 0;
+    drawDashboardCharts(state.dashboard.charts);
+  });
 }
 
 function comparisonFiltersFromForm() {
@@ -1269,6 +1675,7 @@ function comparisonFiltersFromForm() {
   document.querySelectorAll("#comparison-dynamic-fields [name]").forEach((input) => {
     filters[input.name] = input.value;
   });
+  if (mode === "Period") filters.period = "All Periods";
   return filters;
 }
 
@@ -1336,78 +1743,56 @@ async function exportCsv() {
   }
 
   const filters = selectedFilters();
-  if (!filters.datasetId) {
-    toast("Choose a saved dataset before exporting.", true);
+  if (!filters.hospital) {
+    toast("Choose a hospital before exporting.", true);
     return;
   }
-  const query = new URLSearchParams({ datasetId: filters.datasetId });
+  const query = new URLSearchParams({ hospital: filters.hospital });
+  if (filters.range?.start && filters.range?.end) {
+    query.set("startDate", filters.range.start);
+    query.set("endDate", filters.range.end);
+  }
   if (filters.month.length) query.set("month", filters.month.join(","));
   if (filters.period.length) query.set("period", filters.period.join(","));
   window.location.assign(`/api/export.csv?${query.toString()}`);
 }
 
-async function uploadWorkbook(event) {
-  const file = event.target.files[0];
-  if (!file) return;
-  if (file.size > 25 * 1024 * 1024) {
-    toast("Workbook exceeds the 25 MB upload limit.", true);
-    event.target.value = "";
-    return;
-  }
-  const form = new FormData();
-  form.append("file", file);
-  const uploadButton = document.querySelector(".button-upload");
-  uploadButton.textContent = "Uploading…";
-  uploadButton.classList.add("is-busy");
-  try {
-    const response = await request("/api/upload", { method: "POST", body: form });
-    toast(response.upload.inserted
-      ? `Saved ${number(response.upload.inserted)} records for ${response.upload.hospital_name}.`
-      : "This workbook is already saved.");
-    await refreshOptions(response.upload.dataset_id);
-  } catch (error) {
-    toast(error.message, true);
-  } finally {
-    uploadButton.textContent = "＋ Upload workbook";
-    uploadButton.classList.remove("is-busy");
-    event.target.value = "";
-  }
-}
-
-async function refreshOptions(selectedDatasetId = null) {
+async function refreshOptions(selectedHospital = null) {
+  state.appliedRange = null;
+  state.rangeHospital = null;
+  $("#range-type").value = "Full Range";
+  updateRangeControlVisibility();
   const options = await request("/api/options");
   state.options = options;
-  addOptions($("#dataset-select"), options.datasets.map((item) => ({
-    value: item.dataset_id, label: formatDataset(item),
-  })), { selected: selectedDatasetId || options.defaultDatasetId });
-  addOptions($("#comparison-hospital"), ["All Hospitals", ...options.hospitals], {
+  const previousHospital = $("#hospital-select").value;
+  const hospitalOptions = DASHBOARD_HOSPITALS;
+  const hospitalChoices = ["All Hospitals", ...hospitalOptions];
+  const hospital = selectedHospital && hospitalChoices.includes(selectedHospital)
+    ? selectedHospital
+    : hospitalChoices.includes(previousHospital)
+      ? previousHospital
+      : "All Hospitals";
+  addOptions($("#hospital-select"), hospitalChoices, { selected: hospital });
+  if (hospital !== previousHospital) {
+    state.appliedRange = null;
+    state.rangeHospital = null;
+  }
+  const currentUploadHospital = $("#upload-hospital-select").value;
+  const uploadHospital = hospital !== "All Hospitals"
+    ? hospital
+    : DASHBOARD_HOSPITALS.includes(currentUploadHospital)
+      ? currentUploadHospital
+      : "NIMMS Hospital";
+  addOptions($("#upload-hospital-select"), DASHBOARD_HOSPITALS, {
+    selected: uploadHospital,
+  });
+  addOptions($("#comparison-hospital"), ["All Hospitals", ...hospitalOptions], {
     selected: $("#comparison-hospital").value || "All Hospitals",
   });
-  addOptions($("#month-select"), options.months || []);
   if (state.comparisonOptionsLoaded) await loadComparisonOptions(true);
   else createComparisonFields();
+  await loadUploads();
   await loadDashboard();
-}
-
-async function deleteDataset() {
-  const datasetId = $("#dataset-select").value;
-  const dataset = state.options.datasets.find((item) => item.dataset_id === datasetId);
-  if (!dataset) {
-    toast("There is no saved dataset selected.", true);
-    return;
-  }
-  if (!window.confirm(`Permanently delete ${dataset.source_file} for ${dataset.hospital_name}?`)) return;
-  try {
-    await request("/api/datasets/delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ datasetId }),
-    });
-    toast(`Deleted ${dataset.source_file}.`);
-    await refreshOptions();
-  } catch (error) {
-    toast(error.message, true);
-  }
 }
 
 function createComparisonFields() {
@@ -1463,7 +1848,6 @@ function createComparisonFields() {
   } else if (mode === "Period") {
     addField("Year", "year", yearEntries, String(yearTwo), "select");
     addField("Month", "month", months, months[0], "select");
-    addField("Select period", "period", ["All Periods", ...PERIODS], "All Periods", "select");
   } else {
     addField("First start", "start1", [], "", "date");
     addField("First end", "end1", [], "", "date");
@@ -1551,7 +1935,7 @@ function zeroComparisonData() {
   } else if (mode === "Last Months") {
     labels = [`Previous ${selected.monthsCount} months`, `Latest ${selected.monthsCount} months`];
   } else if (mode === "Period") {
-    labels = selected.period === "All Periods" ? PERIODS : [selected.period];
+    labels = PERIODS;
   }
   labels = labels.map((label, index) => label || `Period ${index + 1}`);
   const keys = COMPARISON_SERIES_KEYS.slice(0, labels.length);
@@ -1630,10 +2014,14 @@ function updateHeaderDateRange() {
     return;
   }
 
-  const dateRange = state.dashboard?.dateRange || state.options?.dateRange;
-  header.textContent = dateRange
+  const dateRange = state.appliedRange
+    || state.dashboard?.dateRange
+    || state.options?.dateRange;
+  header.textContent = dateRange?.start && dateRange?.end
     ? `${dateText(dateRange.start)} – ${dateText(dateRange.end)}`
-    : "No reporting data";
+    : state.dashboard?.hasData
+      ? "Data available outside the picker date window"
+      : "No reporting data";
 }
 
 function setComparisonView(view) {
@@ -1782,12 +2170,20 @@ function renderComparisonMovers(data) {
       : comparisonRows;
     const firstIndex = 0;
     const lastIndex = periodLabels.length - 1;
+    const showAllPeriods = $("#comparison-mode")?.value === "Period"
+      && periodLabels.length === 3;
     const isCurrency = metric === "ipdRevenue";
     const entities = rows.map((row) => {
-      const values = row.values || [];
-      const first = Number(values[firstIndex]) || 0;
-      const second = Number(values[lastIndex]) || 0;
-      return { name: row.name || "Unknown", first, second, change: second - first };
+      const values = periodLabels.map((_, index) =>
+        Number(row.values?.[index]) || 0,
+      );
+      return {
+        name: row.name || "Unknown",
+        values,
+        first: values[firstIndex],
+        second: values[lastIndex],
+        change: values[lastIndex] - values[firstIndex],
+      };
     }).sort((left, right) =>
       left.change - right.change || left.name.localeCompare(right.name),
     );
@@ -1797,7 +2193,9 @@ function renderComparisonMovers(data) {
       panels: "Panel",
     }[dimension];
     $("#comparison-movers-title").textContent =
-      `${dimensionLabel} comparison (${periodLabels[firstIndex]} vs ${periodLabels[lastIndex]})`;
+      showAllPeriods
+        ? `${dimensionLabel} comparison (all billing periods)`
+        : `${dimensionLabel} comparison (${periodLabels[firstIndex]} vs ${periodLabels[lastIndex]})`;
 
     const formatMetric = (value) => isCurrency ? compactMoney(value) : number(value);
     const formatChange = (change, first) => {
@@ -1822,7 +2220,13 @@ function renderComparisonMovers(data) {
     table.className = "comparison-mover-table";
     const head = document.createElement("thead");
     const heading = document.createElement("tr");
-    [dimensionLabel, periodLabels[firstIndex], periodLabels[lastIndex], "Change"]
+    [
+      dimensionLabel,
+      ...(showAllPeriods
+        ? periodLabels
+        : [periodLabels[firstIndex], periodLabels[lastIndex]]),
+      showAllPeriods ? "Net change" : "Change",
+    ]
       .forEach((text) => {
         const cell = document.createElement("th");
         cell.textContent = text;
@@ -1837,9 +2241,12 @@ function renderComparisonMovers(data) {
       name.scope = "row";
       name.textContent = row.name;
       tr.append(name);
-      [row.first, row.second].forEach((value, index) => {
+      const visibleValues = showAllPeriods
+        ? row.values
+        : [row.first, row.second];
+      visibleValues.forEach((value, index) => {
         const cell = document.createElement("td");
-        cell.className = `mover-period-value ${index ? "period-b" : "period-a"}`;
+        cell.className = `mover-period-value period-${String.fromCharCode(97 + index)}`;
         cell.textContent = formatMetric(value);
         cell.title = isCurrency ? money(value) : number(value);
         tr.append(cell);
@@ -1853,27 +2260,29 @@ function renderComparisonMovers(data) {
       body.append(tr);
     });
     table.append(body);
-    const totalFirst = entities.reduce((sum, row) => sum + row.first, 0);
-    const totalSecond = entities.reduce((sum, row) => sum + row.second, 0);
+    const totals = periodLabels.map((_, index) =>
+      entities.reduce((sum, row) => sum + row.values[index], 0),
+    );
     const foot = document.createElement("tfoot");
     const totalRow = document.createElement("tr");
     const totalName = document.createElement("th");
     totalName.scope = "row";
     totalName.textContent = `Total (${entities.length})`;
     totalRow.append(totalName);
-    [totalFirst, totalSecond].forEach((value, index) => {
+    (showAllPeriods ? totals : [totals[firstIndex], totals[lastIndex]])
+      .forEach((value, index) => {
       const cell = document.createElement("td");
-      cell.className = `mover-period-value ${index ? "period-b" : "period-a"}`;
+      cell.className = `mover-period-value period-${String.fromCharCode(97 + index)}`;
       cell.textContent = formatMetric(value);
       cell.title = isCurrency ? money(value) : number(value);
       totalRow.append(cell);
     });
     const totalChange = document.createElement("td");
-    const totalDiff = totalSecond - totalFirst;
+    const totalDiff = totals[lastIndex] - totals[firstIndex];
     totalChange.className = `mover-change ${
       totalDiff > 0 ? "increase" : totalDiff < 0 ? "decrease" : "neutral"
     }`;
-    totalChange.textContent = formatChange(totalDiff, totalFirst);
+    totalChange.textContent = formatChange(totalDiff, totals[firstIndex]);
     totalRow.append(totalChange);
     foot.append(totalRow);
     table.append(foot);
@@ -2208,33 +2617,6 @@ function comparisonRangeText(data, index) {
   return `${formatComparisonDate(range[0])} – ${formatComparisonDate(range[1])}`;
 }
 
-function renderComparisonLegends(data, labels) {
-  ["#comparison-chart-legend", "#comparison-trend-legend"].forEach((selector) => {
-    const legend = $(selector);
-    if (!legend) return;
-    legend.replaceChildren();
-    labels.forEach((label, index) => {
-      const item = document.createElement("span");
-      item.className = "comparison-chart-legend-item";
-      const dot = document.createElement("i");
-      dot.className = `comparison-chart-legend-dot${index ? ` ${COMPARISON_SERIES_KEYS[index]}` : ""}`;
-      const text = document.createElement("span");
-      text.className = "legend-text";
-      const name = document.createElement("strong");
-      name.textContent = label;
-      text.append(name);
-      const range = comparisonRangeText(data, index);
-      if (range) {
-        const rangeLine = document.createElement("small");
-        rangeLine.textContent = range;
-        text.append(rangeLine);
-      }
-      item.append(dot, text);
-      legend.append(item);
-    });
-  });
-}
-
 function renderComparisonTrendTables(data) {
   const holder = $("#comparison-trend-tables");
   if (!holder) return;
@@ -2242,6 +2624,8 @@ function renderComparisonTrendTables(data) {
   const labels = data.labels || [];
   const lastIndex = labels.length - 1;
   const trends = data.trends || {};
+  const periodSummary = $("#comparison-mode")?.value === "Period"
+    && labels.length === 3;
   const items = [
     { trend: trends.admissions, fallback: "IPD admission trend", format: number },
     { trend: trends.discharges, fallback: "IPD discharge trend", format: number },
@@ -2303,7 +2687,9 @@ function renderComparisonTrendTables(data) {
     const card = document.createElement("article");
     card.className = "panel comparison-trend-table-card";
     const title = document.createElement("h3");
-    title.textContent = trend?.title || fallback;
+    title.textContent = periodSummary
+      ? (trend?.title || fallback).replace(/ trend by (day|month|period)$/i, " totals by billing period")
+      : trend?.title || fallback;
     card.append(title);
     const rows = trend?.rows || [];
     if (!trend || !rows.length) {
@@ -2313,9 +2699,53 @@ function renderComparisonTrendTables(data) {
         ? "No matching data in these comparison periods."
         : "Trend numbers were not sent by the server. Replace dashboard_service.py with the new version and restart the server.";
       card.append(note);
+    } else if (periodSummary) {
+      const table = document.createElement("table");
+      table.className = "comparison-trend-table";
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      ["Billing period", "Total"].forEach((text) => {
+        const th = document.createElement("th");
+        th.textContent = text;
+        headRow.append(th);
+      });
+      head.append(headRow);
+      const body = document.createElement("tbody");
+      const totals = trend.totals || labels.map((_, index) =>
+        rows.reduce(
+          (sum, row) => sum + (Number(row[COMPARISON_SERIES_KEYS[index]]) || 0),
+          0,
+        ),
+      );
+      labels.forEach((label, index) => {
+        const row = document.createElement("tr");
+        const period = document.createElement("th");
+        period.scope = "row";
+        period.textContent = label;
+        const total = document.createElement("td");
+        total.className = `period-${Math.min(index, 2)}`;
+        total.textContent = data.recordCounts?.[index] === 0
+          ? "No data"
+          : format(Number(totals[index]) || 0);
+        row.append(period, total);
+        body.append(row);
+      });
+      table.append(head, body);
+      const tableWrap = document.createElement("div");
+      tableWrap.className = "comparison-trend-table-wrap";
+      tableWrap.append(table);
+      card.append(tableWrap);
     } else {
       const heading = trend.granularity === "day" ? "Day" : trend.granularity === "month" ? "Month" : "Period";
-      card.append(buildTable(heading, rows, format, trend.totals && trend.totals.length ? trend.totals : null));
+      const tableWrap = document.createElement("div");
+      tableWrap.className = "comparison-trend-table-wrap";
+      tableWrap.append(buildTable(
+        heading,
+        rows,
+        format,
+        trend.totals && trend.totals.length ? trend.totals : null,
+      ));
+      card.append(tableWrap);
     }
     holder.append(card);
   });
@@ -2417,7 +2847,6 @@ function scheduleComparisonChart() {
     const data = state.comparisonData;
     if (!data || $("#comparison-view").classList.contains("is-hidden")) return;
     const labels = data.labels || ["Period 1", "Period 2"];
-    renderComparisonLegends(data, labels);
     renderComparisonTrendTables(data);
     return;
   }
@@ -2431,8 +2860,6 @@ function scheduleComparisonChart() {
       key: COMPARISON_SERIES_KEYS[index],
       label,
     }));
-    renderComparisonLegends(data, labels);
-
     const draw = (selector, key, rows, currency = false) => {
       const container = $(selector);
       renderComparisonColumnChart(

@@ -34,7 +34,7 @@ const offlineReady = (async () => {
   style.textContent = [
     ".offline-report #download-interactive, .offline-report #refresh-data,",
     ".offline-report .button-upload, .offline-report #upload-file,",
-    ".offline-report #delete-dataset { display: none !important; }",
+    ".offline-report #upload-management { display: none !important; }",
   ].join(" ");
   document.head.append(style);
 })();
@@ -63,6 +63,21 @@ function offlineDatasetRows(datasetId) {
   return window.__OFFLINE_DATA__.rows.filter((row) => row[0] === index);
 }
 
+function offlineHospitalRows(hospital) {
+  const indexes = new Set(window.__OFFLINE_DATA__.datasets
+    .map((item, index) => item.hospital_name === hospital ? index : -1)
+    .filter((index) => index >= 0));
+  return window.__OFFLINE_DATA__.rows.filter((row) => indexes.has(row[0]));
+}
+
+function offlineFilterRange(rows, start, end) {
+  if (!start || !end) return [];
+  return rows.filter((row) => {
+    const date = offlineEventDate(row);
+    return date && date >= start && date <= end;
+  });
+}
+
 function offlineMonths(rows) {
   const months = new Set();
   rows.forEach((row) => {
@@ -79,6 +94,44 @@ function offlineRange(rows) {
       : ["Admission", "OPD"].includes(type) ? offlineField(row, "doa") : null;
   }).filter(Boolean).sort();
   return dates.length ? [dates[0], dates[dates.length - 1]] : [null, null];
+}
+
+function offlineDatePickerOptions(rows) {
+  const latestAllowed = new Date();
+  latestAllowed.setHours(0, 0, 0, 0);
+  latestAllowed.setDate(latestAllowed.getDate() + 366);
+  const latestAllowedText = [
+    latestAllowed.getFullYear(),
+    String(latestAllowed.getMonth() + 1).padStart(2, "0"),
+    String(latestAllowed.getDate()).padStart(2, "0"),
+  ].join("-");
+  const dates = rows.map(offlineEventDate).filter((date) =>
+    date && Number(date.slice(0, 4)) >= 2000 && date <= latestAllowedText);
+  const monthMap = new Map();
+  dates.forEach((date) => {
+    const year = Number(date.slice(0, 4));
+    const month = Number(date.slice(5, 7));
+    if (!monthMap.has(year)) monthMap.set(year, new Set());
+    monthMap.get(year).add(month);
+  });
+  const monthsByYear = [...monthMap.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([year, months]) => ({
+      year,
+      months: [...months].sort((left, right) => left - right).map((month) => ({
+        value: month,
+        label: OFFLINE_MONTHS[month - 1],
+      })),
+    }));
+  const sortedDates = [...dates].sort();
+  return {
+    years: monthsByYear.map((entry) => entry.year),
+    monthsByYear,
+    dateRange: {
+      start: sortedDates[0] || null,
+      end: sortedDates[sortedDates.length - 1] || null,
+    },
+  };
 }
 
 function offlineSelectedDays(rows, months = [], periods = []) {
@@ -190,9 +243,8 @@ function offlineTargetForRanges(monthlyTarget, ranges) {
 }
 
 function offlineDashboardTarget(monthlyTarget, start, end, months, periods) {
-  if (!start || !end) return monthlyTarget;
+  if (!start || !end) return 0;
   const selectedMonths = new Set(months.map((month) => OFFLINE_MONTHS.indexOf(month) + 1));
-  const selectedPeriods = new Set(periods);
   const ranges = [];
   const cursor = new Date(`${start}T00:00:00`);
   const final = new Date(`${end}T00:00:00`);
@@ -201,16 +253,25 @@ function offlineDashboardTarget(monthlyTarget, start, end, months, periods) {
     const year = cursor.getFullYear();
     const month = cursor.getMonth() + 1;
     const days = new Date(year, month, 0).getDate();
-    if ((!selectedMonths.size || selectedMonths.has(month)) && selectedPeriods.size) {
+    if (!selectedMonths.size || selectedMonths.has(month)) {
+      const selectedPeriods = periods.length ? periods : OFFLINE_PERIODS;
       selectedPeriods.forEach((period) => {
         const first = period === OFFLINE_PERIODS[0] ? 1 : period === OFFLINE_PERIODS[1] ? 11 : 21;
         const last = period === OFFLINE_PERIODS[0] ? 10 : period === OFFLINE_PERIODS[1] ? 20 : days;
-        ranges.push([`${year}-${String(month).padStart(2, "0")}-${String(first).padStart(2, "0")}`,
-          `${year}-${String(month).padStart(2, "0")}-${String(Math.min(last, days)).padStart(2, "0")}`]);
+        const rangeStart = new Date(`${start}T00:00:00`);
+        const rangeEnd = new Date(`${end}T00:00:00`);
+        const periodStart = new Date(year, month - 1, first);
+        const periodEnd = new Date(year, month - 1, Math.min(last, days));
+        const overlapStart = rangeStart > periodStart ? rangeStart : periodStart;
+        const overlapEnd = rangeEnd < periodEnd ? rangeEnd : periodEnd;
+        if (overlapEnd < overlapStart) return;
+        const iso = (date) => [
+          date.getFullYear(),
+          String(date.getMonth() + 1).padStart(2, "0"),
+          String(date.getDate()).padStart(2, "0"),
+        ].join("-");
+        ranges.push([iso(overlapStart), iso(overlapEnd)]);
       });
-    } else if (!selectedMonths.size || selectedMonths.has(month)) {
-      ranges.push([`${year}-${String(month).padStart(2, "0")}-01`,
-        `${year}-${String(month).padStart(2, "0")}-${String(days).padStart(2, "0")}`]);
     }
     cursor.setMonth(cursor.getMonth() + 1);
   }
@@ -318,7 +379,8 @@ function offlineBucket(rows, predicate, dateField, granularity, valueField = nul
     if (!predicate(row)) return;
     const date = dateField === "event" ? offlineEventDate(row) : offlineField(row, dateField);
     if (!date) return;
-    const label = granularity === "monthly" ? `${OFFLINE_MONTHS[Number(date.slice(5, 7)) - 1].slice(0, 3)} ${date.slice(0, 4)}`
+    const label = granularity === "yearly" ? date.slice(0, 4)
+      : granularity === "monthly" ? `${OFFLINE_MONTHS[Number(date.slice(5, 7)) - 1].slice(0, 3)} ${date.slice(0, 4)}`
       : date.slice(8, 10) + " " + OFFLINE_MONTHS[Number(date.slice(5, 7)) - 1].slice(0, 3);
     grouped.set(label, (grouped.get(label) || 0) + (valueField ? Number(offlineField(row, valueField) || 0) : 1));
   });
@@ -336,19 +398,21 @@ function offlineServices(rows) {
   return services;
 }
 
-function offlineCharts(rows, kpis, months, monthlyTarget) {
+function offlineCharts(rows, kpis, months, monthlyTarget, selectedRange, periods, yearlyTrends = false) {
   const discharge = (row) => offlineField(row, "type") === "Discharge";
   const admission = (row) => offlineField(row, "type") === "Admission";
   const opd = (row) => offlineField(row, "type") === "OPD";
   const datedDischarges = rows.filter((row) => discharge(row) && offlineField(row, "dod"));
-  const granularity = new Set(datedDischarges.map((row) => offlineField(row, "dod"))).size > 45 ? "monthly" : "daily";
+  const granularity = yearlyTrends ? "yearly"
+    : new Set(datedDischarges.map((row) => offlineField(row, "dod"))).size > 45 ? "monthly" : "daily";
   const patientFlow = new Map();
   rows.forEach((row) => {
     const type = offlineField(row, "type");
     if (!["Admission", "Discharge"].includes(type)) return;
     const date = type === "Discharge" ? offlineField(row, "dod") : offlineField(row, "doa");
     if (!date) return;
-    const label = granularity === "monthly" ? `${OFFLINE_MONTHS[Number(date.slice(5, 7)) - 1].slice(0, 3)} ${date.slice(0, 4)}`
+    const label = granularity === "yearly" ? date.slice(0, 4)
+      : granularity === "monthly" ? `${OFFLINE_MONTHS[Number(date.slice(5, 7)) - 1].slice(0, 3)} ${date.slice(0, 4)}`
       : date.slice(8, 10) + " " + OFFLINE_MONTHS[Number(date.slice(5, 7)) - 1].slice(0, 3);
     if (!patientFlow.has(label)) patientFlow.set(label, { label });
     const rowData = patientFlow.get(label);
@@ -378,12 +442,13 @@ function offlineCharts(rows, kpis, months, monthlyTarget) {
   });
   let cumulative = 0;
   let cumulativeTarget = 0;
-  const targetProgress = OFFLINE_PERIODS.map((label, index) => {
+  const targetProgress = OFFLINE_PERIODS.map((label) => {
     cumulative += targetActual.get(label);
-    const days = [10, 20, 31][index];
-    const monthDays = monthNumbers.size === 1
-      ? new Date(2024, [...monthNumbers][0], 0).getDate() : 31;
-    cumulativeTarget += monthlyTarget * Math.min(days, monthDays) / monthDays;
+    if (!(periods || []).length || periods.includes(label)) {
+      cumulativeTarget += offlineDashboardTarget(
+        monthlyTarget, selectedRange.start, selectedRange.end, months, [label],
+      );
+    }
     return { label, actual: cumulative, target: cumulativeTarget };
   });
   const sumValues = (values) => [...values].reduce((total, value) => total + Number(value || 0), 0);
@@ -443,6 +508,7 @@ function offlineCharts(rows, kpis, months, monthlyTarget) {
       targetProgress: {
         actual: targetProgress.length ? targetProgress[targetProgress.length - 1].actual : 0,
         target: targetProgress.length ? targetProgress[targetProgress.length - 1].target : 0,
+        monthlyTarget,
       },
     },
     insights: offlineInsights(rows, monthlyTarget),
@@ -453,28 +519,50 @@ function offlineCharts(rows, kpis, months, monthlyTarget) {
 }
 
 function offlineDashboard(query) {
-  const datasetId = query.searchParams.get("datasetId") || window.__OFFLINE_DATA__.datasets[0]?.dataset_id;
-  const dataset = window.__OFFLINE_DATA__.datasets.find((item) => item.dataset_id === datasetId);
-  if (!dataset) throw new Error("The selected dataset is not available.");
-  const allRows = offlineDatasetRows(datasetId);
+  const hospitals = [...new Set(window.__OFFLINE_DATA__.datasets.map((item) => item.hospital_name))];
+  const hospital = query.searchParams.get("hospital")
+    || window.__OFFLINE_DATA__.datasets[0]?.hospital_name;
+  if (!hospitals.includes(hospital)) throw new Error("The selected hospital is not available.");
+  const dataset = {
+    hospital_name: hospital,
+    source_file: "All saved data",
+    dataset_id: window.__OFFLINE_DATA__.datasets.find(
+      (item) => item.hospital_name === hospital,
+    )?.dataset_id,
+  };
+  const allRows = offlineHospitalRows(hospital);
   const months = query.searchParams.getAll("month");
   const periods = query.searchParams.getAll("period");
-  const rows = offlineFilter(allRows, months, periods);
-  const [start, end] = offlineRange(allRows);
-  const monthlyTarget = offlineMonthlyTarget(dataset.hospital_name);
+  const [fullMinDate, fullMaxDate] = offlineRange(allRows);
+  const dateOptions = offlineDatePickerOptions(allRows);
+  const hasSelectedRange = query.searchParams.has("startDate")
+    && query.searchParams.has("endDate");
+  const start = query.searchParams.get("startDate") || fullMinDate;
+  const end = query.searchParams.get("endDate") || fullMaxDate;
+  const selectedRange = { start, end };
+  const inRange = hasSelectedRange
+    ? offlineFilterRange(allRows, start, end)
+    : allRows;
+  const rows = offlineFilter(inRange, months, periods);
+  const monthlyTarget = offlineMonthlyTarget(hospital);
   const target = offlineDashboardTarget(monthlyTarget, start, end, months, periods);
   const kpis = offlineKpis(
-    rows, dataset.hospital_name, target, offlineSelectedDays(allRows, months, periods),
+    rows, hospital, target, offlineSelectedDays(inRange, months, periods),
   );
   return {
     hasData: true,
     dataset,
-    dateRange: { start, end },
+    dateRange: dateOptions.dateRange,
+    dateOptions,
+    selectedRange,
     recordCount: rows.length,
     filters: { month: months, period: periods },
     options: { months: offlineMonths(allRows), periods: OFFLINE_PERIODS },
     kpis,
-    charts: offlineCharts(rows, kpis, months, monthlyTarget),
+    charts: offlineCharts(
+      rows, kpis, months, monthlyTarget, selectedRange, periods,
+      !hasSelectedRange && !months.length && !periods.length,
+    ),
   };
 }
 
@@ -1002,13 +1090,15 @@ window.fetch = async (input, options = {}) => {
     let payload;
     if (pathname === "/api/options") {
       const datasets = window.__OFFLINE_DATA__.datasets;
-      const defaultDatasetId = datasets[0]?.dataset_id || null;
-      const defaultRows = defaultDatasetId ? offlineDatasetRows(defaultDatasetId) : [];
-      const [start, end] = offlineRange(defaultRows);
+      const defaultHospital = datasets[0]?.hospital_name || null;
+      const defaultRows = defaultHospital ? offlineHospitalRows(defaultHospital) : [];
+      const dateOptions = offlineDatePickerOptions(defaultRows);
       payload = {
         datasets, hospitals: [...new Set(datasets.map((item) => item.hospital_name))].sort(),
-        periods: OFFLINE_PERIODS, defaultDatasetId,
-        months: offlineMonths(defaultRows), dateRange: { start, end },
+        periods: OFFLINE_PERIODS, defaultDatasetId: datasets[0]?.dataset_id || null,
+        defaultHospital,
+        months: offlineMonths(defaultRows), dateRange: dateOptions.dateRange,
+        dateOptions,
         comparison: offlineComparisonOptions(),
       };
 
@@ -1028,8 +1118,14 @@ window.fetch = async (input, options = {}) => {
           }));
         } else {
           const filters = selectedFilters();
+          const [minDate, maxDate] = offlineRange(offlineHospitalRows(filters.hospital));
+          const range = filters.range || { start: minDate, end: maxDate };
           const filtered = offlineFilter(
-            offlineDatasetRows(filters.datasetId), filters.month, filters.period,
+            offlineFilterRange(
+              offlineHospitalRows(filters.hospital), range.start, range.end,
+            ),
+            filters.month,
+            filters.period,
           );
           const headers = ["DOA", "DOD", "Type", "Month", "Dept. Name", "Doctor Name",
             "Panel Name", "Service Type", "Service Name", "Service Final Amount",
@@ -1057,6 +1153,8 @@ window.fetch = async (input, options = {}) => {
           downloadOfflineCsv();
         }, true);
       });
+    } else if (pathname === "/api/uploads") {
+      payload = { uploads: [] };
     } else if (pathname === "/api/dashboard") {
       payload = offlineDashboard(url);
     } else if (pathname === "/api/comparison/options") {
