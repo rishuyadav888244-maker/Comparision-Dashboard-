@@ -96,6 +96,11 @@ function offlineRange(rows) {
   return dates.length ? [dates[0], dates[dates.length - 1]] : [null, null];
 }
 
+function offlineDoaRange(rows) {
+  const dates = rows.map((row) => offlineField(row, "doa")).filter(Boolean).sort();
+  return dates.length ? [dates[0], dates[dates.length - 1]] : [null, null];
+}
+
 function offlineDatePickerOptions(rows) {
   const latestAllowed = new Date();
   latestAllowed.setHours(0, 0, 0, 0);
@@ -134,8 +139,10 @@ function offlineDatePickerOptions(rows) {
   };
 }
 
-function offlineSelectedDays(rows, months = [], periods = []) {
-  const [start, end] = offlineRange(rows);
+function offlineSelectedDays(rows, months = [], periods = [], selectedRange = null) {
+  const [doaStart, doaEnd] = offlineDoaRange(rows);
+  const start = selectedRange?.start || doaStart;
+  const end = selectedRange?.end || doaEnd;
   if (!start || !end) return 0;
 
   const selectedMonths = new Set(months.map((month) => OFFLINE_MONTHS.indexOf(month) + 1));
@@ -193,6 +200,34 @@ function offlineFilter(rows, months = [], periods = []) {
 
 function offlineSum(rows, predicate, field) {
   return rows.reduce((total, row) => total + (predicate(row) ? Number(offlineField(row, field) || 0) : 0), 0);
+}
+
+function offlineConsultationMatcher(schemaRows) {
+  const datasetIndexes = new Set(schemaRows.map((schemaRow) => schemaRow[0]));
+  const datasets = window.__OFFLINE_DATA__.datasets;
+  const hasServiceType = [...datasetIndexes].some(
+    (index) => datasets[index]?.service_type_available,
+  );
+  const hasServiceName = [...datasetIndexes].some(
+    (index) => datasets[index]?.service_name_available,
+  );
+  return (row) => {
+    if (offlineField(row, "type") !== "OPD") return false;
+    if (hasServiceType) {
+      return String(offlineField(row, "serviceType") || "").trim().toLowerCase()
+        === "consultation";
+    }
+    if (hasServiceName) {
+      return String(offlineField(row, "service") || "")
+        .toLowerCase().includes("consultation");
+    }
+    return true;
+  };
+}
+
+function offlineConsultationCount(rows, schemaRows = rows) {
+  const isConsultation = offlineConsultationMatcher(schemaRows);
+  return rows.filter(isConsultation).length;
 }
 
 function offlineGroup(rows, predicate, dimension, value = null) {
@@ -278,7 +313,9 @@ function offlineDashboardTarget(monthlyTarget, start, end, months, periods) {
   return offlineTargetForRanges(monthlyTarget, ranges);
 }
 
-function offlineKpis(rows, hospital, target, selectedDays = offlineSelectedDays(rows)) {
+function offlineKpis(
+  rows, hospital, target, selectedDays = offlineSelectedDays(rows), schemaRows = rows,
+) {
   const discharge = (row) => offlineField(row, "type") === "Discharge";
   const opd = (row) => offlineField(row, "type") === "OPD";
   const admissions = rows.filter((row) => offlineField(row, "type") === "Admission").length;
@@ -297,8 +334,7 @@ function offlineKpis(rows, hospital, target, selectedDays = offlineSelectedDays(
     arpp: discharges.length ? ipdRevenue / discharges.length : 0,
     per_day_patient_charge: bedDays ? ipdRevenue / bedDays : 0,
     per_day_revenue: selectedDays ? (ipdRevenue + opdRevenue) / selectedDays : 0,
-    opd_consultation: rows.filter((row) => opd(row)
-      && String(offlineField(row, "serviceType") || "").toLowerCase() === "consultation").length,
+    opd_consultation: offlineConsultationCount(rows, schemaRows),
     admissions,
     discharges: discharges.length,
     bed_days: bedDays,
@@ -398,10 +434,14 @@ function offlineServices(rows) {
   return services;
 }
 
-function offlineCharts(rows, kpis, months, monthlyTarget, selectedRange, periods, yearlyTrends = false) {
+function offlineCharts(
+  rows, kpis, months, monthlyTarget, selectedRange, periods,
+  yearlyTrends = false, schemaRows = rows,
+) {
   const discharge = (row) => offlineField(row, "type") === "Discharge";
   const admission = (row) => offlineField(row, "type") === "Admission";
   const opd = (row) => offlineField(row, "type") === "OPD";
+  const isConsultation = offlineConsultationMatcher(schemaRows);
   const datedDischarges = rows.filter((row) => discharge(row) && offlineField(row, "dod"));
   const granularity = yearlyTrends ? "yearly"
     : new Set(datedDischarges.map((row) => offlineField(row, "dod"))).size > 45 ? "monthly" : "daily";
@@ -457,9 +497,9 @@ function offlineCharts(rows, kpis, months, monthlyTarget, selectedRange, periods
   const trendTotal = (series) => series.reduce((total, row) => total + Number(row.value || 0), 0);
   const revenueTrend = offlineBucket(rows, discharge, "dod", granularity, "amount");
   const patientFlowRows = [...patientFlow.values()];
-  const opdTrend = offlineBucket(rows, (row) => opd(row)
-    && String(offlineField(row, "serviceType") || "").toLowerCase() === "consultation",
-  "doa", granularity);
+  const opdTrend = offlineBucket(
+    rows, isConsultation, "doa", granularity,
+  );
   const periodRevenueRows = [...periodRevenue.entries()].map(([label, value]) => ({ label, value }));
   const periodDischargeRows = [...periodDischarges.entries()].map(([label, value]) => ({ label, value }));
   const services = offlineServices(rows);
@@ -479,9 +519,9 @@ function offlineCharts(rows, kpis, months, monthlyTarget, selectedRange, periods
     admissionDoctors: offlineRanked(offlineGroup(rows, admission, "doctor")),
     ipdRevenueDepartments: offlineRanked(offlineGroup(rows, discharge, "department", "amount")),
     ipdRevenueDoctors: offlineRanked(offlineGroup(rows, discharge, "doctor", "amount")),
-    opdDoctors: offlineRanked(offlineGroup(rows, (row) => opd(row)
-      && String(offlineField(row, "serviceType") || "").toLowerCase() === "consultation",
-    "doctor")),
+    opdDoctors: offlineRanked(offlineGroup(
+      rows, isConsultation, "doctor",
+    )),
     opdServices: services,
     panels,
     periodRevenue: periodRevenueRows,
@@ -500,8 +540,11 @@ function offlineCharts(rows, kpis, months, monthlyTarget, selectedRange, periods
       admissionDoctors: { value: totalFor(admission, "doctor") },
       ipdRevenueDepartments: { value: totalFor(discharge, "department", "amount") },
       ipdRevenueDoctors: { value: totalFor(discharge, "doctor", "amount") },
-      opdDoctors: { value: totalFor((row) => opd(row)
-        && String(offlineField(row, "serviceType") || "").toLowerCase() === "consultation", "doctor") },
+      opdDoctors: {
+        value: totalFor(
+          isConsultation, "doctor",
+        ),
+      },
       opdServices: { value: trendTotal(services) },
       periodRevenue: { value: trendTotal(periodRevenueRows) },
       periodDischarges: { value: trendTotal(periodDischargeRows) },
@@ -533,8 +576,9 @@ function offlineDashboard(query) {
   const allRows = offlineHospitalRows(hospital);
   const months = query.searchParams.getAll("month");
   const periods = query.searchParams.getAll("period");
-  const [fullMinDate, fullMaxDate] = offlineRange(allRows);
   const dateOptions = offlineDatePickerOptions(allRows);
+  const fullMinDate = dateOptions.dateRange.start;
+  const fullMaxDate = dateOptions.dateRange.end;
   const hasSelectedRange = query.searchParams.has("startDate")
     && query.searchParams.has("endDate");
   const start = query.searchParams.get("startDate") || fullMinDate;
@@ -547,7 +591,11 @@ function offlineDashboard(query) {
   const monthlyTarget = offlineMonthlyTarget(hospital);
   const target = offlineDashboardTarget(monthlyTarget, start, end, months, periods);
   const kpis = offlineKpis(
-    rows, hospital, target, offlineSelectedDays(inRange, months, periods),
+    rows, hospital, target,
+    offlineSelectedDays(
+      allRows, months, periods, { start, end },
+    ),
+    allRows,
   );
   return {
     hasData: true,
@@ -562,6 +610,7 @@ function offlineDashboard(query) {
     charts: offlineCharts(
       rows, kpis, months, monthlyTarget, selectedRange, periods,
       !hasSelectedRange && !months.length && !periods.length,
+      allRows,
     ),
   };
 }

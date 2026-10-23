@@ -73,6 +73,84 @@ class WebDashboardServiceTests(unittest.TestCase):
 
         self.assertEqual(consultations["UHID"].tolist(), ["U1"])
 
+    def test_opd_consultation_filter_falls_back_to_service_name_without_service_type(self):
+        frame = pd.DataFrame([
+            {"Type": "OPD", "Service Name": "Gastro Consultation", "UHID": "U1"},
+            {"Type": "OPD", "Service Name": "CBC", "UHID": "U2"},
+            {"Type": "Discharge", "Service Name": "Consultation", "UHID": "U3"},
+        ])
+
+        consultations = backend.opd_consultation_records(frame)
+
+        self.assertEqual(consultations["UHID"].tolist(), ["U1"])
+
+    def test_opd_consultation_filter_uses_service_type_when_available(self):
+        frame = pd.DataFrame([
+            {
+                "Type": "OPD", "Service Type": "Laboratory",
+                "Service Name": "Consultation", "UHID": "U1",
+            },
+            {
+                "Type": "OPD", "Service Type": "Consultation",
+                "Service Name": "CBC", "UHID": "U2",
+            },
+        ])
+
+        consultations = backend.opd_consultation_records(frame)
+
+        self.assertEqual(consultations["UHID"].tolist(), ["U2"])
+
+    def test_opd_consultation_filter_falls_back_when_service_type_is_empty(self):
+        frame = pd.DataFrame([
+            {
+                "Type": "OPD", "Service Type": "",
+                "Service Name": "Gastro Consultation", "UHID": "U1",
+            },
+            {
+                "Type": "OPD", "Service Type": "",
+                "Service Name": "CBC", "UHID": "U2",
+            },
+        ])
+
+        consultations = backend.opd_consultation_records(frame)
+
+        self.assertEqual(consultations["UHID"].tolist(), ["U1"])
+
+    def test_revenue_totals_keep_fractional_amounts_until_display(self):
+        frame = pd.DataFrame([
+            {"Type": "Discharge", "Service Final Amount": 0.1},
+            {"Type": "Discharge", "Service Final Amount": 0.2},
+            {"Type": "OPD", "Service Final Amount": 0.05},
+        ])
+
+        totals = backend.revenue_totals(frame)
+
+        self.assertEqual(totals["discharge"], 0.3)
+        self.assertEqual(totals["opd"], 0.05)
+        self.assertEqual(totals["total"], 0.35)
+
+    def test_dashboard_per_day_revenue_uses_inclusive_selected_date_range(self):
+        result = dashboard_service.get_dashboard({
+            "hospital": "Surya Hospital",
+            "startDate": "2025-01-08",
+            "endDate": "2025-01-09",
+        })
+
+        self.assertEqual(result["kpis"]["revenue"], 1250)
+        self.assertEqual(result["kpis"]["per_day_revenue"], 625)
+
+    def test_dashboard_per_day_revenue_uses_full_doa_span_without_selected_range(self):
+        frame = pd.DataFrame([
+            {"Type": "Admission", "DOA": "01/01/2025"},
+            {"Type": "OPD", "DOA": "10/01/2025"},
+            {"Type": "Discharge", "DOA": "01/01/2025", "DOD": "01/01/2025"},
+        ])
+
+        self.assertEqual(
+            dashboard_service._dashboard_selected_days(frame),
+            10,
+        )
+
     def test_opd_service_records_use_type_and_service_name_only(self):
         frame = pd.DataFrame([
             {
@@ -246,9 +324,17 @@ class WebDashboardServiceTests(unittest.TestCase):
 
     def test_dashboard_selected_days_respect_month_period_and_calendar_boundaries(self):
         frame = pd.DataFrame([
-            {"Type": "Discharge", "DOD": "2024-01-08"},
+            {
+                "Type": "Discharge",
+                "DOA": "2024-01-08",
+                "DOD": "2024-01-08",
+            },
             {"Type": "OPD", "DOA": "2024-02-25"},
-            {"Type": "Discharge", "DOD": "2024-03-05"},
+            {
+                "Type": "Discharge",
+                "DOA": "2024-03-05",
+                "DOD": "2024-03-05",
+            },
         ])
 
         self.assertEqual(dashboard_service._dashboard_selected_days(frame), 58)

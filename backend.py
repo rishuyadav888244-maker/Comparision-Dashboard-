@@ -1,5 +1,6 @@
 import calendar
 import re
+from decimal import Decimal
 
 import pandas as pd
 
@@ -322,15 +323,22 @@ def service_final_amounts(df):
     return pd.to_numeric(df["Service Final Amount"], errors="coerce").fillna(0)
 
 
+def precise_sum(values):
+    return float(sum(
+        (Decimal(str(value)) for value in values if pd.notna(value)),
+        Decimal("0"),
+    ))
+
+
 def revenue_totals(df):
     if "Type" not in df.columns:
         return {"discharge": 0.0, "opd": 0.0, "admission": 0.0, "total": 0.0}
 
     report_type = df["Type"].astype(str).str.strip()
     amounts = service_final_amounts(df)
-    discharge_revenue = float(amounts.loc[report_type.eq("Discharge")].sum())
-    opd_revenue = float(amounts.loc[report_type.eq("OPD")].sum())
-    admission_revenue = float(amounts.loc[report_type.eq("Admission")].sum())
+    discharge_revenue = precise_sum(amounts.loc[report_type.eq("Discharge")])
+    opd_revenue = precise_sum(amounts.loc[report_type.eq("OPD")])
+    admission_revenue = precise_sum(amounts.loc[report_type.eq("Admission")])
     return {
         "discharge": discharge_revenue,
         "opd": opd_revenue,
@@ -340,15 +348,25 @@ def revenue_totals(df):
 
 
 def opd_consultation_records(df):
-    if not {"Type", "Service Type"}.issubset(df.columns):
+    if "Type" not in df.columns:
         return df.iloc[0:0].copy()
     report_type = df["Type"].fillna("").astype(str).str.strip().str.casefold()
-    service_type = (
+    opd_rows = report_type.eq("opd")
+    service_type_values = (
         df["Service Type"].fillna("").astype(str).str.strip().str.casefold()
+        if "Service Type" in df.columns
+        else pd.Series("", index=df.index, dtype="object")
     )
-    return df.loc[
-        report_type.eq("opd") & service_type.eq("consultation")
-    ].copy()
+    if "Service Type" in df.columns and service_type_values.ne("").any():
+        service_type = service_type_values
+        consultation = service_type.eq("consultation")
+    elif "Service Name" in df.columns:
+        consultation = df["Service Name"].fillna("").astype(str).str.contains(
+            "consultation", case=False, na=False
+        )
+    else:
+        consultation = pd.Series(True, index=df.index)
+    return df.loc[opd_rows & consultation].copy()
 
 
 def calculate_kpis(df, total_beds=TOTAL_BEDS, target=DEFAULT_TARGET):
@@ -357,8 +375,8 @@ def calculate_kpis(df, total_beds=TOTAL_BEDS, target=DEFAULT_TARGET):
     report_type = df["Type"].astype(str).str.strip().str.casefold()
     discharge_df = df[report_type.eq("discharge")]
 
-    cash_due = discharge_df["Cash Due"].sum()
-    credit_due = discharge_df["Credit Due"].sum()
+    cash_due = precise_sum(discharge_df["Cash Due"])
+    credit_due = precise_sum(discharge_df["Credit Due"])
 
     opd_consultation = len(opd_consultation_records(df))
 

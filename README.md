@@ -10,11 +10,18 @@ Requires Python 3.13.
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python server.py
+python dev_server.py
 ```
 
 Open <http://127.0.0.1:8010> in your browser. The application creates
 `hospital_data.db` locally the first time it starts.
+
+`dev_server.py` watches Python and frontend files during local development.
+Changes to Python code restart the server automatically; changes to frontend
+files reload the open dashboard automatically. Run `python server.py` instead
+if you do not want automatic reloads. To enable this after running the regular
+server, stop it once and launch `python dev_server.py`; subsequent code edits
+will reload automatically.
 
 Raw admission, discharge, and service reports are stored under the local
 `uploads/raw_reports/` directory and combined into a separate dataset for the

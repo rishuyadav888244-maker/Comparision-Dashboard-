@@ -44,6 +44,36 @@ class UploadManagementTests(unittest.TestCase):
         database.UPLOADS_DIR = self.original_uploads_dir
         self.temp_dir.cleanup()
 
+    def test_development_version_endpoint_requires_dev_mode(self):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), DashboardHandler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict("os.environ", {"DASHBOARD_DEV_RELOAD": "1"}):
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", httpd.server_port, timeout=10
+                )
+                connection.request("GET", "/api/dev/version")
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertTrue(payload["enabled"])
+                self.assertTrue(payload["version"])
+                connection.close()
+
+            with patch.dict("os.environ", {"DASHBOARD_DEV_RELOAD": ""}):
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", httpd.server_port, timeout=10
+                )
+                connection.request("GET", "/api/dev/version")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 404)
+                connection.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
     def test_empty_database_still_offers_hospitals_for_upload(self):
         options = dashboard_service.dashboard_options()
 
@@ -167,6 +197,7 @@ class UploadManagementTests(unittest.TestCase):
         self.assertEqual(dashboard["recordCount"], len(rows))
         self.assertEqual(dashboard["kpis"]["revenue"], 650)
         self.assertEqual(dashboard["kpis"]["opd_revenue"], 350)
+        self.assertAlmostEqual(dashboard["kpis"]["per_day_revenue"], 650 / 158)
 
     def test_picker_date_window_uses_2000_through_today_plus_366_days(self):
         frame = pd.DataFrame({
@@ -667,11 +698,11 @@ class UploadManagementTests(unittest.TestCase):
 
     def test_interactive_export_keeps_stable_raw_dataset_id(self):
         raw = make_csv(
-            ["File Id", "UHID", "Doa"],
-            [["F1", "6001", "2026-08-01"]],
+            ["Service Date", "UHID", "Service Name"],
+            [["2026-08-01", "6001", "Gastro Consultation"]],
         )
         uploaded = dashboard_service.upload_files(
-            [("admissions.csv", raw)], hospital_name="Export Hospital"
+            [("services.csv", raw)], hospital_name="Export Hospital"
         )
 
         with patch(
@@ -687,6 +718,8 @@ class UploadManagementTests(unittest.TestCase):
         bundle = json.loads(zlib.decompress(base64.b64decode(match.group(1))))
         self.assertEqual(bundle["datasets"][0]["dataset_id"], uploaded["dataset_id"])
         self.assertTrue(uploaded["dataset_id"].startswith("raw-"))
+        self.assertFalse(bundle["datasets"][0]["service_type_available"])
+        self.assertTrue(bundle["datasets"][0]["service_name_available"])
         self.assertTrue(bundle["rows"])
         self.assertTrue(all(row[0] == 0 for row in bundle["rows"]))
         self.assertIn("function offlineDatasetRows(datasetId)", html)
@@ -694,6 +727,8 @@ class UploadManagementTests(unittest.TestCase):
             "item.dataset_id === datasetId",
             html,
         )
+        self.assertIn("function offlineDoaRange(rows)", html)
+        self.assertIn("function offlineConsultationMatcher(schemaRows)", html)
         self.assertNotIn('/assets/offline-dashboard.js', html)
 
     def test_dashboard_uses_all_hospital_datasets_and_prorates_selected_range(self):

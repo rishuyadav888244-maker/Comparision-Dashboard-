@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import mimetypes
 import os
@@ -28,13 +29,48 @@ MAX_REQUEST_BYTES = 80 * 1024 * 1024
 logger = logging.getLogger("hospital_dashboard")
 
 
+def _development_version():
+    digest = hashlib.sha256()
+    ignored_directories = {
+        ".git", ".pytest_cache", ".venv", "__pycache__",
+        "backup", "tests", "uploads",
+    }
+    for base, python_only in ((ROOT, True), (STATIC, False)):
+        for current, directories, files in os.walk(base):
+            directories[:] = [
+                name for name in directories if name not in ignored_directories
+            ]
+            for filename in files:
+                if python_only and not filename.endswith(".py"):
+                    continue
+                path = Path(current) / filename
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+                digest.update(
+                    path.relative_to(ROOT).as_posix().encode("utf-8")
+                )
+                digest.update(str(stat.st_mtime_ns).encode("ascii"))
+                digest.update(str(stat.st_size).encode("ascii"))
+    return digest.hexdigest()
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "HospitalDashboard/1.0"
 
     def do_GET(self):
         request = urlparse(self.path)
         try:
-            if request.path == "/api/health":
+            if (
+                request.path == "/api/dev/version"
+                and os.environ.get("DASHBOARD_DEV_RELOAD") == "1"
+            ):
+                self._json_response({
+                    "enabled": True,
+                    "version": _development_version(),
+                })
+            elif request.path == "/api/health":
                 self._json_response({"status": "ok"})
             elif request.path == "/api/options":
                 self._json_response(dashboard_service.dashboard_options())

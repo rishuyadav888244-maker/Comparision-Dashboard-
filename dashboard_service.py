@@ -76,6 +76,14 @@ def export_interactive_html():
             "record_count": len(frame),
             "date_start": _json_value(date_range[0]),
             "date_end": _json_value(date_range[1]),
+            "service_type_available": bool(
+                "Service Type" in frame.columns
+                and frame["Service Type"].fillna("").astype(str).str.strip().ne("").any()
+            ),
+            "service_name_available": bool(
+                "Service Name" in frame.columns
+                and frame["Service Name"].fillna("").astype(str).str.strip().ne("").any()
+            ),
         })
         frame = frame.reindex(columns=_OFFLINE_ROW_COLUMNS)
         for values in frame.itertuples(index=False, name=None):
@@ -463,15 +471,18 @@ def _dashboard_target_by_period(monthly_target, start, end, months, periods):
     return target_by_period
 
 
-def _dashboard_selected_days(frame, months=(), periods=()):
-    event_dates = pd.to_datetime(
-        backend.comparison_event_dates(frame), errors="coerce"
-    ).dropna()
-    if event_dates.empty:
-        return 0
-
-    start = event_dates.min().normalize()
-    end = event_dates.max().normalize()
+def _dashboard_selected_days(frame, months=(), periods=(), start=None, end=None):
+    if start is None or end is None:
+        if "DOA" not in frame:
+            return 1
+        doa_dates = backend._coerce_datetime(frame["DOA"]).dropna()
+        if doa_dates.empty:
+            return 1
+        start = doa_dates.min().normalize()
+        end = doa_dates.max().normalize()
+    else:
+        start = pd.Timestamp(start).normalize()
+        end = pd.Timestamp(end).normalize()
     selected_months = set()
     for month in months:
         parsed = pd.to_datetime(str(month), format="%B", errors="coerce")
@@ -1014,7 +1025,14 @@ def _get_dashboard_cached(
         kpis["ipd_revenue"], kpis["bed_days"]
     )
     kpis["per_day_revenue"] = _ratio(
-        kpis["revenue"], _dashboard_selected_days(ranged, months, periods)
+        kpis["revenue"],
+        _dashboard_selected_days(
+            frame,
+            months,
+            periods,
+            selected_start,
+            selected_end,
+        ),
     )
     return _json_value({
         "hasData": True,

@@ -288,7 +288,7 @@ async function downloadInteractiveHtml() {
     toast(error.message, true);
   } finally {
     button.disabled = false;
-    button.textContent = "Offline HTML";
+    button.textContent = "Download";
   }
 }
 
@@ -296,6 +296,7 @@ async function initialize() {
   try {
     const options = await request("/api/options");
     state.options = options;
+    startDevelopmentReload();
     $("#upload-management").open = false;
     const hospitalOptions = DASHBOARD_HOSPITALS;
     addOptions($("#hospital-select"), ["All Hospitals", ...hospitalOptions], {
@@ -863,26 +864,38 @@ function renderKpis(kpis = {}) {
       : "—";
   const showMoney = (value) =>
     typeof value === "number" && Number.isFinite(value) ? money(value) : "—";
+  const exactNumber = (value) =>
+    typeof value === "number" && Number.isFinite(value)
+      ? value.toLocaleString("en-IN", { maximumFractionDigits: 8 })
+      : "—";
+  const exactMoney = (value) =>
+    typeof value === "number" && Number.isFinite(value)
+      ? `₹${value.toLocaleString("en-IN", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })}`
+      : "—";
   const descriptors = [
-    ["Admissions", showNumber(kpis.admissions, { maximumFractionDigits: 0 }), COLORS.teal],
-    ["Discharges", showNumber(kpis.discharges, { maximumFractionDigits: 0 }), COLORS.teal],
-    ["OPD consultations", showNumber(kpis.opd_consultation, { maximumFractionDigits: 0 }), COLORS.teal],
-    ["Total revenue", showMoney(kpis.revenue), COLORS.teal],
-    ["IPD revenue", showMoney(kpis.ipd_revenue), COLORS.teal],
-    ["OPD revenue", showMoney(kpis.opd_revenue), COLORS.teal],
-    ["Cash due", showMoney(kpis.cash_due), COLORS.teal],
-    ["Credit due", showMoney(kpis.credit_due), COLORS.teal],
-    ["Average length of stay", `${showNumber(kpis.alos, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${typeof kpis.alos === "number" && Number.isFinite(kpis.alos) ? " days" : ""}`, COLORS.teal],
-    ["ARPP", showMoney(kpis.arpp), COLORS.teal],
-    ["Per day per patient charge", showMoney(kpis.per_day_patient_charge), COLORS.teal],
-    ["Per day revenue", showMoney(kpis.per_day_revenue), COLORS.teal],
+    ["Admissions", showNumber(kpis.admissions, { maximumFractionDigits: 0 }), COLORS.teal, kpis.admissions],
+    ["Discharges", showNumber(kpis.discharges, { maximumFractionDigits: 0 }), COLORS.teal, kpis.discharges],
+    ["OPD consultations", showNumber(kpis.opd_consultation, { maximumFractionDigits: 0 }), COLORS.teal, kpis.opd_consultation],
+    ["Total revenue", showMoney(kpis.revenue), COLORS.teal, kpis.revenue, "currency"],
+    ["IPD revenue", showMoney(kpis.ipd_revenue), COLORS.teal, kpis.ipd_revenue, "currency"],
+    ["OPD revenue", showMoney(kpis.opd_revenue), COLORS.teal, kpis.opd_revenue, "currency"],
+    ["Cash due", showMoney(kpis.cash_due), COLORS.teal, kpis.cash_due, "currency"],
+    ["Credit due", showMoney(kpis.credit_due), COLORS.teal, kpis.credit_due, "currency"],
+    ["Average length of stay", `${showNumber(kpis.alos, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${typeof kpis.alos === "number" && Number.isFinite(kpis.alos) ? " days" : ""}`, COLORS.teal, kpis.alos],
+    ["ARPP", showMoney(kpis.arpp), COLORS.teal, kpis.arpp, "currency"],
+    ["Per day per patient charge", showMoney(kpis.per_day_patient_charge), COLORS.teal, kpis.per_day_patient_charge, "currency"],
+    ["Per day revenue", showMoney(kpis.per_day_revenue), COLORS.teal, kpis.per_day_revenue, "currency"],
   ];
   const grid = $("#kpi-grid");
   grid.replaceChildren();
-  descriptors.forEach(([label, value, accent]) => {
+  descriptors.forEach(([label, value, accent, actual, kind]) => {
     const card = document.createElement("article");
     card.className = "kpi-card";
     card.style.setProperty("--accent", accent);
+    card.title = `Actual value: ${kind === "currency" ? exactMoney(actual) : exactNumber(actual)}`;
     const title = document.createElement("span");
     title.className = "kpi-label";
     title.textContent = label;
@@ -3009,6 +3022,43 @@ function renderComparisonInsights(data) {
       + `the collected share of IPD billing was `
       + `${first("collectionRate").toFixed(1)}% vs ${last("collectionRate").toFixed(1)}%.`,
   );
+}
+
+function startDevelopmentReload() {
+  let currentVersion = null;
+  let initialized = false;
+  let checking = false;
+  let pollTimer = null;
+
+  const checkForChanges = async () => {
+    if (checking) return;
+    checking = true;
+    try {
+      const response = await fetch("/api/dev/version", { cache: "no-store" });
+      if (response.status === 404) {
+        if (pollTimer !== null) window.clearInterval(pollTimer);
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(`Development reload check failed (${response.status}).`);
+      }
+      const payload = await response.json();
+      if (!payload.enabled) return;
+      if (!initialized) {
+        currentVersion = payload.version;
+        initialized = true;
+      } else if (payload.version !== currentVersion) {
+        window.location.reload();
+      }
+    } catch (error) {
+      console.warn("Could not check for local dashboard changes; retrying.", error);
+    } finally {
+      checking = false;
+    }
+  };
+
+  void checkForChanges();
+  pollTimer = window.setInterval(checkForChanges, 1000);
 }
 
 initialize();
