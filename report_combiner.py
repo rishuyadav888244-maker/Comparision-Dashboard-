@@ -4,7 +4,8 @@ import csv
 import hashlib
 import math
 import re
-from collections import Counter
+import threading
+from collections import Counter, OrderedDict
 from datetime import date, datetime
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -82,14 +83,49 @@ _FINAL_AMOUNT_HEADERS = (
 )
 _CASH_DUE_HEADERS = ("cashdue", "cashdueamount")
 _CREDIT_DUE_HEADERS = ("creditdue", "creditdueamount")
+_PARSED_FRAME_CACHE_LIMIT = 128 * 1024 * 1024
+_PARSED_FRAME_CACHE = OrderedDict()
+_PARSED_FRAME_CACHE_SIZE = 0
+_PARSED_FRAME_CACHE_LOCK = threading.Lock()
 
 
 def read_raw_file(filename: str, file_bytes: bytes) -> pd.DataFrame:
     """Read a raw xlsx, xls, or csv report and detect a lower header row."""
+    global _PARSED_FRAME_CACHE_SIZE
     if not file_bytes:
         raise ValueError("The selected report is empty.")
 
     suffix = Path(filename).suffix.casefold()
+    cache_key = (suffix, hashlib.sha256(file_bytes).digest())
+    with _PARSED_FRAME_CACHE_LOCK:
+        cached = _PARSED_FRAME_CACHE.pop(cache_key, None)
+        if cached is not None:
+            _PARSED_FRAME_CACHE[cache_key] = cached
+            return cached.copy()
+
+    frame = _read_raw_file(filename, file_bytes, suffix)
+    frame_size = int(frame.memory_usage(index=True, deep=True).sum())
+    if frame_size <= _PARSED_FRAME_CACHE_LIMIT:
+        with _PARSED_FRAME_CACHE_LOCK:
+            previous = _PARSED_FRAME_CACHE.pop(cache_key, None)
+            if previous is not None:
+                _PARSED_FRAME_CACHE_SIZE -= int(
+                    previous.memory_usage(index=True, deep=True).sum()
+                )
+            while (
+                _PARSED_FRAME_CACHE
+                and _PARSED_FRAME_CACHE_SIZE + frame_size > _PARSED_FRAME_CACHE_LIMIT
+            ):
+                _, oldest = _PARSED_FRAME_CACHE.popitem(last=False)
+                _PARSED_FRAME_CACHE_SIZE -= int(
+                    oldest.memory_usage(index=True, deep=True).sum()
+                )
+            _PARSED_FRAME_CACHE[cache_key] = frame.copy()
+            _PARSED_FRAME_CACHE_SIZE += frame_size
+    return frame
+
+
+def _read_raw_file(filename: str, file_bytes: bytes, suffix: str) -> pd.DataFrame:
     if suffix in {".xlsx", ".xls"}:
         try:
             raw = pd.read_excel(BytesIO(file_bytes), header=None, dtype=object)

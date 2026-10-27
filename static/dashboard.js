@@ -47,6 +47,14 @@ function compactMoney(value) {
   return `₹${amount.toFixed(0)}`;
 }
 
+function targetMoney(value) {
+  const amount = Number(value || 0);
+  if (Math.abs(amount) >= 10000000) {
+    return `₹${(amount / 10000000).toFixed(2)}Cr`;
+  }
+  return compactMoney(amount);
+}
+
 function number(value) {
   return Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: 0 });
 }
@@ -55,7 +63,11 @@ function dateText(value) {
   if (!value) return "Not available";
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return String(value);
-  return parsed.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  return parsed.toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  });
 }
 
 function toast(message, isError = false) {
@@ -314,11 +326,10 @@ async function initialize() {
     state.comparisonOptionsLoaded = Array.isArray(options.comparison?.years);
     createComparisonFields();
     bindEvents();
-    await loadUploads();
-    if (options.datasets.length) {
-      await loadDashboard();
-    }
-    else renderNoData();
+    const initialLoads = [loadUploads()];
+    if (options.datasets.length) initialLoads.push(loadDashboard());
+    await Promise.all(initialLoads);
+    if (!options.datasets.length) renderNoData();
   } catch (error) {
     toast(error.message, true);
   }
@@ -337,6 +348,18 @@ function bindEvents() {
     await loadDashboard();
   });
   $("#upload-hospital-select").addEventListener("change", loadUploads);
+  $("#upload-management").addEventListener("toggle", () => {
+    if ($("#upload-management").open) {
+      loadScraperStatus();
+    }
+  });
+  document.addEventListener("click", (event) => {
+    const managementPanel = $("#upload-management");
+    if (managementPanel.open && !managementPanel.contains(event.target)) {
+      managementPanel.open = false;
+    }
+  });
+  $("#scraper-import").addEventListener("click", importScraperReports);
   $("#range-type").addEventListener("change", updateRangeControlVisibility);
   $("#range-month-year-select").addEventListener("change", () => {
     updateMonthSelect(
@@ -713,10 +736,91 @@ async function loadUploads() {
   }
 }
 
+function renderScraperStatus(status) {
+  const message = $("#scraper-status");
+  const list = $("#scraper-report-list");
+  const importButton = $("#scraper-import");
+  list.replaceChildren();
+  if (!status.folderExists) {
+    message.textContent = `Scraper folder not found: ${status.folder}`;
+  } else if (!status.ready) {
+    const lastImport = status.lastImport?.imported_at
+      ? ` Last successful import: ${dateText(status.lastImport.imported_at)}.`
+      : "";
+    message.textContent = status.reportFileCount
+      ? `${number(status.reportFileCount)} report file(s) found, but a complete Admission, Discharge, and Service batch is not ready.`
+      : `No unprocessed scraper reports found.${lastImport}`;
+  } else {
+    message.textContent = `${number(status.reportFileCount)} report file(s) found. Latest complete batch: ${dateText(status.candidateDate)}. ${number(status.pendingFileCount)} report(s) are new.`;
+    status.candidateFiles.forEach((file) => {
+      const row = document.createElement("p");
+      row.className = "scraper-report-row";
+      row.textContent = `${file.fileName} · ${file.imported ? "already imported" : "pending"}`;
+      list.append(row);
+    });
+  }
+  const archive = status.archive || {};
+  $("#scraper-archive-status").textContent = archive.days
+    ? `${number(archive.rows)} older rows archived across ${number(archive.days)} day(s)${archive.from && archive.to ? ` · ${dateText(archive.from)} to ${dateText(archive.to)}` : ""}.`
+    : "Only the latest scraper batch is kept; no older scraper data is archived.";
+  importButton.disabled = !status.ready || !status.needsImport;
+  importButton.textContent = status.ready && !status.needsImport
+    ? "Up to date"
+    : "Import reports";
+}
+
+async function loadScraperStatus() {
+  try {
+    const status = await request("/api/scraper/status");
+    renderScraperStatus(status);
+  } catch (error) {
+    $("#scraper-status").textContent = `Could not check scraper reports: ${error.message}`;
+    $("#scraper-import").disabled = true;
+    toast(error.message, true);
+  }
+}
+
+async function importScraperReports() {
+  const button = $("#scraper-import");
+  if (button.disabled) return;
+  button.disabled = true;
+  button.textContent = "Importing…";
+  $("#scraper-status").textContent = "Importing scraper reports and preparing the archive…";
+  let importComplete = false;
+  try {
+    const response = await request("/api/scraper/import", { method: "POST" });
+    const result = response.result;
+    importComplete = true;
+    toast(
+      `Imported ${number(result.active_rows)} latest-batch rows and removed ${number(result.rawReportsPruned)} previous scraper report(s).`,
+    );
+    await refreshOptions("NIMMS Hospital");
+    await loadScraperStatus();
+  } catch (error) {
+    $("#scraper-status").textContent = importComplete
+      ? `Reports imported, but dashboard refresh failed: ${error.message}`
+      : `Import failed: ${error.message}`;
+    toast(error.message, true);
+    button.disabled = importComplete;
+    button.textContent = importComplete ? "Imported" : "Import reports";
+  }
+}
+
 async function manageReportUpload(event) {
   const button = event.target.closest("button[data-upload-id]");
-  if (!button) return;
+  if (!button || button.disabled) return;
   const uploadId = button.dataset.uploadId;
+  const row = button.closest(".upload-list-row");
+  const rowButtons = [...row.querySelectorAll("button")];
+  const status = $("#upload-status");
+  const originalText = button.textContent;
+  rowButtons.forEach((actionButton) => { actionButton.disabled = true; });
+  if (button.dataset.action === "delete") {
+    button.textContent = "Deleting…";
+    status.textContent = "Deleting report and updating dashboard…";
+  } else {
+    status.textContent = "Updating report and dashboard…";
+  }
   try {
     if (button.dataset.action === "delete") {
       if (!window.confirm("Permanently delete this uploaded report?")) return;
@@ -725,6 +829,10 @@ async function manageReportUpload(event) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ uploadId }),
       });
+      row.remove();
+      const remaining = document.querySelectorAll("#upload-list .upload-list-row").length;
+      if (!remaining) renderUploadList([]);
+      $("#upload-summary-count").textContent = `${number(remaining)} reports`;
       toast("Report deleted and hospital data rebuilt.");
     } else {
       await request("/api/uploads/include", {
@@ -740,6 +848,12 @@ async function manageReportUpload(event) {
     await refreshOptions($("#hospital-select").value);
   } catch (error) {
     toast(error.message, true);
+  } finally {
+    if (button.isConnected) {
+      rowButtons.forEach((actionButton) => { actionButton.disabled = false; });
+      button.textContent = originalText;
+    }
+    status.textContent = "";
   }
 }
 
@@ -776,7 +890,7 @@ async function uploadReports() {
     toast(response.upload.inserted
       ? `Saved ${number(response.upload.inserted)} records for ${hospitalName}.`
       : "The selected reports were already saved.");
-    status.textContent = "Refreshing dashboard…";
+    status.textContent = "Updating dashboard data…";
     await refreshOptions(hospitalName);
   } catch (error) {
     toast(error.message, true);
@@ -1087,6 +1201,7 @@ function drawDashboardCharts(charts) {
     color: COLORS.teal, formatter: compactMoney, mode: "line",
     showAllValueLabels: true,
     showPercentLabels: false,
+    showAverage: true,
     total: totals.revenueTrend,
   });
   drawGroupedBars($("#flow-chart"), charts.patientFlow, [
@@ -1095,11 +1210,14 @@ function drawDashboardCharts(charts) {
   ], totals.patientFlow, {
     showAllValueLabels: true,
     showPercent: false,
+    showAverage: true,
+    averageTogether: true,
   });
   drawBars($("#opd-trend-chart"), charts.opdDaily, {
     color: COLORS.teal, mode: "line",
     showAllValueLabels: true,
     showPercentLabels: false,
+    showAverage: true,
     total: totals.opdDaily,
   });
   drawTargetProgress(totals.targetProgress);
@@ -1129,9 +1247,9 @@ function drawTargetProgress(totals = {}) {
   const ring = $("#target-progress-ring");
   const circumference = 2 * Math.PI * 86;
 
-  $("#target-progress-target").textContent = compactMoney(target);
+  $("#target-progress-target").textContent = targetMoney(target);
   $("#target-progress-monthly").textContent =
-    `Monthly target: ${compactMoney(monthlyTarget)}`;
+    `Monthly target: ${targetMoney(monthlyTarget)}`;
   $("#target-progress-actual").textContent = compactMoney(actual);
   $("#target-progress-remaining").textContent = compactMoney(remaining);
   $("#target-progress-value").textContent = `${achievement.toFixed(1)}%`;
@@ -1181,14 +1299,59 @@ function renderTotalItems(footer, items) {
   footer.replaceChildren();
   items.forEach((item) => {
     const total = document.createElement("span");
-    total.className = "chart-total-item";
+    total.className = `chart-total-item${item.compact ? " is-compact-average" : ""}`;
+    if (item.title) total.title = item.title;
     const label = document.createElement("span");
     label.textContent = item.label;
+    total.append(label);
+    if (item.values) {
+      const values = document.createElement("span");
+      values.className = "chart-total-series-values";
+      item.values.forEach((entry) => {
+        const seriesValue = document.createElement("span");
+        seriesValue.className = "chart-total-series-value";
+        seriesValue.style.color = entry.color;
+        seriesValue.title = entry.label;
+        if (!item.hideSeriesLabels) {
+          const seriesLabel = document.createElement("span");
+          seriesLabel.textContent = entry.label;
+          seriesValue.append(seriesLabel);
+        }
+        const value = document.createElement("strong");
+        value.textContent = entry.formatter(entry.value);
+        value.style.color = entry.color;
+        seriesValue.append(value);
+        values.append(seriesValue);
+      });
+      total.append(values);
+      footer.append(total);
+      return;
+    }
     const value = document.createElement("strong");
     value.textContent = item.formatter(item.value);
-    total.append(label, value);
+    total.append(value);
     footer.append(total);
   });
+}
+
+function chartTotalItems(rows, total, formatter, showAverage = false) {
+  const format = formatter || number;
+  const value = total?.value ?? (rows || []).reduce(
+    (sum, row) => sum + Number(row.value || 0), 0,
+  );
+  const items = [{
+    label: "Grand total",
+    value,
+    formatter: format,
+  }];
+  if (showAverage) {
+    items.push({
+      label: "Average per displayed period",
+      value: rows?.length ? value / rows.length : null,
+      formatter: (average) => Number.isFinite(average) ? format(average) : "—",
+    });
+  }
+  return items;
 }
 
 function setupCanvas(canvas) {
@@ -1277,20 +1440,18 @@ function drawBars(canvas, rows, options = {}) {
   if (!rows || !rows.length || width < 30 || height < 40) {
     drawEmpty(ctx, width, height);
     attachChartTooltip(canvas, []);
-    renderChartTotal(canvas.parentElement, [{
-      label: "Grand total",
-      value: options.total?.value ?? 0,
-      formatter: options.formatter || number,
-    }]);
+    renderChartTotal(
+      canvas.parentElement,
+      chartTotalItems(rows, options.total, options.formatter, options.showAverage),
+    );
     return;
   }
   if (options.horizontal) {
     drawHorizontalBars(canvas, ctx, width, height, rows, options, horizontalLayout);
-    renderChartTotal(canvas.parentElement, [{
-      label: "Grand total",
-      value: options.total?.value ?? rows.reduce((sum, row) => sum + Number(row.value || 0), 0),
-      formatter: options.formatter || number,
-    }]);
+    renderChartTotal(
+      canvas.parentElement,
+      chartTotalItems(rows, options.total, options.formatter, options.showAverage),
+    );
     return;
   }
   const margin = {
@@ -1394,11 +1555,10 @@ function drawBars(canvas, rows, options = {}) {
     }
   });
   attachChartTooltip(canvas, hitboxes);
-  renderChartTotal(canvas.parentElement, [{
-    label: "Grand total",
-    value: options.total?.value ?? rows.reduce((sum, row) => sum + Number(row.value || 0), 0),
-    formatter: options.formatter || number,
-  }]);
+  renderChartTotal(
+    canvas.parentElement,
+    chartTotalItems(rows, options.total, options.formatter, options.showAverage),
+  );
 }
 
 function wrapHorizontalLabel(ctx, text, maxWidth) {
@@ -1527,11 +1687,10 @@ function drawGroupedBars(canvas, rows, series, totals = {}, options = {}) {
   if (!rows || !rows.length || width < 30 || height < 40) {
     drawEmpty(ctx, width, height);
     attachChartTooltip(canvas, []);
-    renderChartTotal(canvas.parentElement, series.map((item) => ({
-      label: `Grand total · ${item.label || item.key}`,
-      value: totals[item.key] ?? 0,
-      formatter: item.formatter || number,
-    })));
+    renderChartTotal(
+      canvas.parentElement,
+      groupedChartTotalItems(series, totals, [], options),
+    );
     return;
   }
   const margin = {
@@ -1616,13 +1775,56 @@ function drawGroupedBars(canvas, rows, series, totals = {}, options = {}) {
     }
   });
   attachChartTooltip(canvas, hitboxes);
-  renderChartTotal(canvas.parentElement, series.map((item) => ({
-    label: `Grand total · ${item.label || item.key}`,
-    value: totals[item.key] ?? rows.reduce(
+  renderChartTotal(
+    canvas.parentElement,
+    groupedChartTotalItems(series, totals, rows, options),
+  );
+}
+
+function groupedChartTotalItems(series, totals, rows, options) {
+  const seriesTotals = series.map((item) => {
+    const formatter = item.formatter || number;
+    const value = totals[item.key] ?? rows.reduce(
       (sum, row) => sum + Number(row[item.key] || 0), 0,
-    ),
-    formatter: item.formatter || number,
-  })));
+    );
+    return {
+      key: item.key,
+      label: item.label || item.key,
+      color: item.color,
+      value,
+      formatter,
+    };
+  });
+  const items = seriesTotals.map((item) => ({
+    label: `Grand total · ${item.label}`,
+    value: item.value,
+    formatter: item.formatter,
+  }));
+  if (options.averageTogether) {
+    items.push({
+      label: options.averageTogether ? "Avg / period" : "Average per displayed period",
+      compact: Boolean(options.averageTogether),
+      hideSeriesLabels: Boolean(options.averageTogether),
+      title: options.averageTogether
+        ? "Average per displayed period · Admissions, then Discharges"
+        : undefined,
+      values: seriesTotals.map((item) => ({
+        label: item.label,
+        color: item.color,
+        value: rows.length ? item.value / rows.length : null,
+        formatter: (value) => Number.isFinite(value) ? item.formatter(value) : "—",
+      })),
+    });
+  } else if (options.showAverage) {
+    seriesTotals.forEach((item) => {
+      items.push({
+        label: `Average per displayed period · ${item.label}`,
+        value: rows.length ? item.value / rows.length : null,
+        formatter: (value) => Number.isFinite(value) ? item.formatter(value) : "—",
+      });
+    });
+  }
+  return items;
 }
 
 function attachChartTooltip(canvas, hitboxes) {
@@ -1803,10 +2005,13 @@ async function refreshOptions(selectedHospital = null) {
   addOptions($("#comparison-hospital"), ["All Hospitals", ...hospitalOptions], {
     selected: $("#comparison-hospital").value || "All Hospitals",
   });
-  if (state.comparisonOptionsLoaded) await loadComparisonOptions(true);
-  else createComparisonFields();
-  await loadUploads();
-  await loadDashboard();
+  if (Array.isArray(options.comparison?.years)) {
+    state.comparisonOptionsLoaded = true;
+  } else if (state.comparisonOptionsLoaded) {
+    state.options.comparison = await request("/api/comparison/options");
+  }
+  createComparisonFields();
+  await Promise.all([loadUploads(), loadDashboard()]);
 }
 
 function createComparisonFields() {
@@ -2017,6 +2222,10 @@ function renderComparison(data) {
 function updateHeaderDateRange() {
   const header = $("#date-range");
   const activeView = document.querySelector(".view-tab.is-active")?.dataset.view || "overview";
+  const isPrediction = activeView === "comparison" && state.comparisonView === "prediction";
+  header.closest(".topbar-period")?.classList.toggle("is-hidden", isPrediction);
+  if (isPrediction) return;
+
   if (activeView === "comparison") {
     const ranges = state.comparisonData?.periodRanges;
     if (Array.isArray(ranges) && ranges.length) {
@@ -2040,6 +2249,7 @@ function updateHeaderDateRange() {
 
 function setComparisonView(view) {
   state.comparisonView = ["charts", "prediction"].includes(view) ? view : "numbers";
+  updateHeaderDateRange();
   const select = $("#comparison-view-mode");
   if (select) select.value = state.comparisonView;
   const content = $("#comparison-content");
@@ -2111,6 +2321,22 @@ function comparisonKpiMetric(data, metricLabel) {
 function renderComparisonKpis(data) {
   const grid = $("#comparison-kpis");
   grid.replaceChildren();
+  const compactPeriodLabel = (index) => {
+    const range = data.periodRanges?.[index];
+    if ($("#comparison-mode")?.value !== "Last Months"
+      || !Array.isArray(range) || range.length < 2) return data.labels[index];
+    const [start, end] = range.map((date) => new Date(`${date}T00:00:00`));
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return data.labels[index];
+    const month = (date) => date.toLocaleDateString("en-US", { month: "short" });
+    const startMonth = month(start);
+    const endMonth = month(end);
+    if (start.getFullYear() === end.getFullYear()) {
+      return start.getMonth() === end.getMonth()
+        ? `${startMonth} ${start.getFullYear()}`
+        : `${startMonth}–${endMonth} ${end.getFullYear()}`;
+    }
+    return `${startMonth} ${start.getFullYear()}–${endMonth} ${end.getFullYear()}`;
+  };
   COMPARISON_KPI_ORDER.forEach(([metricLabel, displayLabel]) => {
     const metric = comparisonKpiMetric(data, metricLabel);
     if (!metric) return;
@@ -2127,7 +2353,7 @@ function renderComparisonKpis(data) {
       const item = document.createElement("div");
       item.className = "comparison-value";
       const period = document.createElement("span");
-      period.textContent = data.labels[index];
+      period.textContent = compactPeriodLabel(index);
       period.title = data.labels[index];
       const value = document.createElement("strong");
       value.textContent = comparisonValue(metricValue, metric.kind);
@@ -2148,7 +2374,7 @@ function renderComparisonKpis(data) {
 }
 
 function renderComparisonMovers(data) {
-    const metric = state.comparisonMoverMetric;
+const metric = state.comparisonMoverMetric;
     const dimension = state.comparisonMoverDimension;
     const periodLabels = data.labels || ["A", "B"];
     const moverRows = data.moverData?.[metric]?.[dimension];
@@ -2622,7 +2848,7 @@ function comparisonMoverChartRows(data, metricKey, dimension, limit = 10) {
 function formatComparisonDate(value) {
   const parsed = new Date(`${value}T00:00:00`);
   if (Number.isNaN(parsed.getTime())) return String(value || "");
-  return parsed.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+  return dateText(value);
 }
 
 function comparisonRangeText(data, index) {

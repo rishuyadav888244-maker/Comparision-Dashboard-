@@ -56,6 +56,19 @@ class TestReportCombiner(unittest.TestCase):
         self.assertEqual(report[0]["rows_used"], 0)
         self.assertEqual(report[0]["columns"], admission_headers())
 
+    def test_raw_file_cache_reuses_parsed_frame_without_sharing_mutations(self):
+        content = csv_report(
+            admission_headers(),
+            [["CACHE-UNIQUE-1", "00123", "A Patient", "Dr A", "Medicine", "Cash", "2026-08-01", "10", "9", "1", "0"]],
+        )
+        first = read_raw_file("cached-admissions.csv", content)
+        first.iloc[0, 0] = "mutated"
+
+        with patch("report_combiner._read_raw_file", side_effect=AssertionError):
+            cached = read_raw_file("cached-admissions.csv", content)
+
+        self.assertEqual(cached.iloc[0, 0], "CACHE-UNIQUE-1")
+
     def test_combining_reuses_preparsed_upload_frames(self):
         content = csv_report(
             admission_headers(),

@@ -109,6 +109,7 @@ def export_interactive_html():
         "datasets": offline_datasets,
         "rows": offline_rows,
         "periods": backend.PERIOD_OPTIONS,
+        "comparison": comparison_options(),
         "predictions": prediction_cache,
     }
     compressed = zlib.compress(
@@ -603,8 +604,7 @@ def dashboard_options():
     }
     default_hospital = "All Hospitals"
     if default_hospital:
-        version = _data_version(datasets)
-        frame = _cached_master_frame(version)
+        frame = database.load_comparison_date_data()
         date_options = _date_picker_options(frame)
         result["defaultHospital"] = default_hospital
         result["defaultDatasetId"] = None
@@ -983,9 +983,6 @@ def _get_dashboard_cached(
     filtered = backend.apply_filters(
         ranged, month=list(months), period=list(periods)
     )
-    kpis = backend.calculate_dashboard_metrics(
-        filtered, hospital_name
-    )
     occupancy_rows = filtered.copy()
     if selected_start is not None and selected_end is not None:
         doa_dates = pd.to_datetime(
@@ -994,9 +991,7 @@ def _get_dashboard_cached(
         occupancy_rows.loc[
             ~doa_dates.between(selected_start, selected_end).fillna(False), "DOA"
         ] = pd.NaT
-    kpis["occupancy"] = backend.calculate_dashboard_metrics(
-        occupancy_rows, hospital_name
-    )["occupancy"]
+    kpis = backend.calculate_dashboard_metrics(occupancy_rows, hospital_name)
     monthly_target = backend.monthly_revenue_target(hospital_name)
     if not start_date and min_date is None:
         target_by_period = dict.fromkeys(backend.PERIOD_OPTIONS, 0.0)
@@ -2585,17 +2580,24 @@ def rebuild_hospital_raw_reports(
     *,
     uploads_to_add=(),
     upload_to_delete=None,
+    upload_ids_to_delete=(),
     include_change=None,
     parsed_frames=None,
+    scraper_snapshot=None,
 ):
-    if upload_to_delete and include_change is not None:
+    upload_ids_to_delete = tuple(dict.fromkeys(upload_ids_to_delete))
+    if upload_to_delete:
+        upload_ids_to_delete = tuple(dict.fromkeys(
+            (*upload_ids_to_delete, upload_to_delete)
+        ))
+    if upload_ids_to_delete and include_change is not None:
         raise ValueError("A report upload cannot be deleted and toggled together.")
     selected_hospital = _hospital_for_upload("", hospital_name)
     with _REPORT_UPLOAD_LOCK:
         existing_uploads = database.load_report_uploads(
             selected_hospital, included_only=False
         )
-        deleted_ids = {upload_to_delete} if upload_to_delete else set()
+        deleted_ids = set(upload_ids_to_delete)
         proposed = [
             item for item in existing_uploads
             if item["upload_id"] not in deleted_ids
@@ -2631,6 +2633,8 @@ def rebuild_hospital_raw_reports(
             (item["file_name"], item["file_bytes"])
             for item in included_uploads
         ], parsed_frames=parsed_frames)
+        if scraper_snapshot is not None and merged_frame.empty:
+            raise ValueError("The scraper reports did not produce dashboard rows.")
         report_stats = []
         staged_by_hash = {item["content_hash"]: item for item in staged}
         for item, result in zip(included_uploads, combined_report):
@@ -2660,9 +2664,10 @@ def rebuild_hospital_raw_reports(
             merged_frame,
             combined_hash,
             uploads_to_add=staged,
-            upload_to_delete=upload_to_delete,
+            upload_ids_to_delete=upload_ids_to_delete,
             include_change=include_change,
             report_stats=report_stats,
+            scraper_snapshot=scraper_snapshot,
         )
         result["combined_hash"] = combined_hash
         result["new_upload_count"] = sum(

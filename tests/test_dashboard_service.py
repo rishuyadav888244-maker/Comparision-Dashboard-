@@ -490,6 +490,17 @@ class WebDashboardServiceTests(unittest.TestCase):
             75_500_000,
         )
 
+    def test_monthly_revenue_targets_are_fixed_per_hospital(self):
+        self.assertEqual(
+            backend.monthly_revenue_target("NIMMS Hospital"), 25_500_000
+        )
+        self.assertEqual(
+            backend.monthly_revenue_target("Surya Hospital"), 50_000_000
+        )
+        self.assertEqual(
+            backend.monthly_revenue_target("All Hospitals"), 75_500_000
+        )
+
     def test_three_year_nimms_full_range_target_uses_three_calendar_years(self):
         for year in (2024, 2025, 2026):
             rows = self.rows_2025.copy()
@@ -1348,10 +1359,10 @@ class WebDashboardServiceTests(unittest.TestCase):
             metric for metric in result["metrics"]
             if metric["label"] == "Revenue target"
         )
-        self.assertEqual(target["first"], 25_000_000 * 12)
-        self.assertEqual(target["second"], 25_000_000 * 12)
+        self.assertEqual(target["first"], 25_500_000 * 12)
+        self.assertEqual(target["second"], 25_500_000 * 12)
         self.assertEqual(backend.monthly_revenue_target("Surya Hospital"), 50_000_000)
-        self.assertEqual(backend.monthly_revenue_target("All Hospitals"), 75_000_000)
+        self.assertEqual(backend.monthly_revenue_target("All Hospitals"), 75_500_000)
 
     def test_upload_excel_validates_and_saves_workbook(self):
         workbook = BytesIO()
