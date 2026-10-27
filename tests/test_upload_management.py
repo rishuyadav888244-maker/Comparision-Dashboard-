@@ -731,6 +731,38 @@ class UploadManagementTests(unittest.TestCase):
         self.assertIn("function offlineConsultationMatcher(schemaRows)", html)
         self.assertNotIn('/assets/offline-dashboard.js', html)
 
+    def test_interactive_export_comparison_options_ignore_outlier_years(self):
+        rows = pd.DataFrame([
+            {"Type": "Admission", "DOA": "1900-01-01", "UHID": "OLD"},
+            {"Type": "Admission", "DOA": "2024-06-10", "UHID": "VALID-1"},
+            {"Type": "Discharge", "DOA": "2024-06-01", "DOD": "2026-09-30", "UHID": "VALID-2"},
+            {"Type": "Admission", "DOA": "2029-01-01", "UHID": "FUTURE"},
+        ])
+        database.save_hospital_data(
+            rows, "Outlier Export Hospital", "outlier-dates.xlsx", b"outlier-export"
+        )
+        dashboard_service._invalidate_data_caches()
+
+        with patch(
+            "prediction_service.get_prediction",
+            return_value={"hasData": False, "message": "No data"},
+        ):
+            html = dashboard_service.export_interactive_html().decode("utf-8")
+
+        match = re.search(
+            r'window\.__OFFLINE_BUNDLE__="([A-Za-z0-9+/=]+)"', html
+        )
+        self.assertIsNotNone(match)
+        bundle = json.loads(zlib.decompress(base64.b64decode(match.group(1))))
+        self.assertEqual(
+            bundle["comparison"],
+            {
+                "years": [2024, 2026],
+                "months": ["June", "September"],
+                "latestDate": "2026-09-30",
+            },
+        )
+
     def test_dashboard_uses_all_hospital_datasets_and_prorates_selected_range(self):
         shared = {
             "Month": "August",

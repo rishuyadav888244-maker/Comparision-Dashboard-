@@ -6,6 +6,8 @@ import pandas as pd
 
 TOTAL_BEDS = 155
 DEFAULT_TARGET = 50_000_000
+NIMMS_MONTHLY_REVENUE_TARGET = 25_500_000
+SURYA_MONTHLY_REVENUE_TARGET = 50_000_000
 PERIOD_OPTIONS = ["1-10 Days", "11-20 Days", "21-31 Days"]
 
 REQUIRED_COLUMNS = [
@@ -423,9 +425,11 @@ def calculate_kpis(df, total_beds=TOTAL_BEDS, target=DEFAULT_TARGET):
 def monthly_revenue_target(hospital):
     hospital_name = str(hospital).strip().casefold()
     if hospital_name == "nimms hospital":
-        return 25_500_000
+        return NIMMS_MONTHLY_REVENUE_TARGET
+    if hospital_name == "surya hospital":
+        return SURYA_MONTHLY_REVENUE_TARGET
     if hospital_name == "all hospitals":
-        return DEFAULT_TARGET + 25_500_000
+        return SURYA_MONTHLY_REVENUE_TARGET + NIMMS_MONTHLY_REVENUE_TARGET
     return DEFAULT_TARGET
 
 

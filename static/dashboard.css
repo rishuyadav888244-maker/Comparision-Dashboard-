@@ -164,6 +164,12 @@ h1 { margin-bottom: 3px; color: var(--navy); font-size: clamp(23.3px, 2.5vw, 29.
 .upload-list-actions { display: inline-flex; flex-wrap: wrap; gap: 5px; }
 .upload-list-actions .button { min-height: 25px; padding: 3px 7px; font-size: 9px; }
 .upload-list-empty { margin: 2px 0; color: #617687; font-size: 10px; }
+.scraper-management { margin-top: 11px; padding-top: 10px; border-top: 1px solid #e5ecef; }
+.scraper-management-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.scraper-management-heading h3 { margin: 0; color: var(--navy); font-size: 11px; }
+.scraper-management-heading p, .scraper-archive-status { margin: 4px 0 0; color: #617687; font-size: 10px; }
+.scraper-report-list { display: grid; gap: 3px; margin-top: 6px; }
+.scraper-report-row { margin: 0; overflow-wrap: anywhere; color: #2e4558; font-size: 10px; }
 .multi-select { position: relative; min-width: 0; }
 .multi-select-trigger {
   display: flex;
@@ -271,6 +277,10 @@ h1 { margin-bottom: 3px; color: var(--navy); font-size: clamp(23.3px, 2.5vw, 29.
 .chart-total { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px 16px; margin-top: 5px; padding-top: 5px; border-top: 1px solid #edf1f3; }
 .chart-total-item { display: inline-flex; align-items: center; gap: 6px; color: #3a4f61; font-size: 10.5px; }
 .chart-total-item strong { color: var(--navy); font-size: 11.5px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.chart-total-series-values, .chart-total-series-value { display: inline-flex; align-items: center; }
+.chart-total-series-values { gap: 10px; }
+.chart-total-series-value { gap: 4px; white-space: nowrap; }
+.chart-total-item.is-compact-average { white-space: nowrap; }
 .comparison-chart-total { position: relative; z-index: 1; min-height: 25px; margin-top: 8px; padding: 7px 8px 2px; border-top-color: #dce6eb; background: #fff; }
 .chart-tooltip { position: absolute; z-index: 2; max-width: 210px; padding: 7px 9px; border: 1px solid rgba(255,255,255,.12); border-radius: 7px; background: var(--navy); box-shadow: 0 5px 15px rgba(16,47,73,.18); color: #fff; font-size: 11.5px; line-height: 1.35; pointer-events: none; opacity: 0; transform: translateY(3px); transition: opacity .1s ease, transform .1s ease; }
 .chart-tooltip.is-visible { opacity: 1; transform: translateY(0); }
@@ -575,6 +585,13 @@ th:not(:first-child) { text-align: right; }
   .print-context { display: block; margin: 0 0 12px; padding: 8px 0; border-bottom: 1px solid #cbd8df; color: #263d50; font-size: 10pt; }
   .page-shell { width: 100%; padding: 14px 0; }
   .chart-grid, .chart-grid-lead, .comparison-chart-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .comparison-chart-grid-2 { grid-template-columns: minmax(0, 1fr); }
+  .comparison-mini-card-wide { grid-column: auto; }
+  .comparison-mini-card { break-inside: avoid; }
+  .comparison-column-chart.comparison-compact-chart { height: 260px; }
+  .comparison-trend-tables { grid-template-columns: minmax(0, 1fr); }
+  .comparison-trend-table-wrap { overflow: visible; }
+  .comparison-trend-table { min-width: 0; table-layout: auto; }
   .operational-breakdowns-grid > .table-panel { height: auto; }
   .operational-breakdowns-grid .table-scroll { max-height: none; }
   .patient-activity-grid > .table-panel { height: auto; }
@@ -692,7 +709,7 @@ th:not(:first-child) { text-align: right; }
 /* KPIs */
 .comparison-kpi-grid { gap: 8px; margin-bottom: 8px; }
 .comparison-kpi { min-height: 0; padding: 8px 10px; }
-.comparison-kpi-label { min-height: 0; margin-bottom: 5px; font-size: 11px; }
+.comparison-kpi-label { min-height: 2.4em; margin-bottom: 5px; font-size: 11px; line-height: 1.2; }
 .comparison-kpi .comparison-values { gap: 3px; }
 .comparison-kpi .comparison-value { padding: 3px 8px; }
 .comparison-kpi .comparison-value span { font-size: 11px; }
@@ -794,12 +811,11 @@ body { font-size: 14px; }
 #overview-view .dashboard-panel-performance,
 #overview-view .dashboard-insights { display: flex; min-width: 0; flex-direction: column; }
 #overview-view .panel-performance-card,
-#overview-view .panel-insights-card { flex: 1 1 auto; }
+#overview-view .panel-insights-card { flex: 1 1 auto; height: auto; }
 #overview-view .panel-performance-card { display: flex; flex-direction: column; }
-#overview-view .panel-performance-card .chart-wrap { flex: 1 1 auto; height: auto; min-height: 220px; }
+#overview-view .panel-performance-card .chart-wrap { flex: none; height: 220px; min-height: 0; }
 #overview-view .panel-insights-card { display: flex; flex-direction: column; }
 #overview-view .dashboard-insights .insights-grid { flex: 1 1 auto; min-height: 0; }
-#overview-view .dashboard-insights .insight-row { flex: 1 1 0; }
 .kpi-grid, .comparison-kpi-grid { gap: 10px; margin-bottom: 14px; }
 .kpi-card { min-height: 82px; padding: 11px 13px; border-radius: 12px; }
 .kpi-label { margin-bottom: 5px; font-size: 10px; }
@@ -885,7 +901,7 @@ body { font-size: 14px; }
   .kpi-value { font-size: 16px; }
 }
 
-@media (min-width: 1001px) {
+@media (min-width: 851px) {
   #overview-view .dashboard-lower-grid {
     align-items: stretch;
   }
@@ -895,12 +911,12 @@ body { font-size: 14px; }
   }
   #overview-view .panel-performance-card,
   #overview-view .panel-insights-card {
-    height: 100%;
+    height: auto;
   }
   #overview-view .panel-performance-card .chart-wrap {
-    flex: 1 1 auto;
-    height: auto;
-    min-height: 220px;
+    flex: none;
+    height: 220px;
+    min-height: 0;
   }
   #overview-view .dashboard-insights .insights-grid {
     display: grid;
@@ -911,7 +927,7 @@ body { font-size: 14px; }
   }
   #overview-view .dashboard-insights .insight-row {
     display: grid;
-    min-height: 52px;
+    min-height: 48px;
     grid-template-columns: 22px minmax(0, 1fr);
     grid-template-rows: auto auto;
     align-content: center;
@@ -937,7 +953,7 @@ body { font-size: 14px; }
   }
 }
 
-@media (min-width: 681px) and (max-width: 1000px) {
+@media (min-width: 681px) and (max-width: 850px) {
   #overview-view .dashboard-lower-grid {
     grid-template-columns: minmax(0, 1fr);
     align-items: stretch;

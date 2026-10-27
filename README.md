@@ -37,6 +37,32 @@ in the future are excluded; Discharge rows use DOD, and Admission/OPD rows use
 DOA. These picker bounds do not remove records: Full Range continues to include
 all saved rows, including rows with outlier dates.
 
+## NuvertOS scraper storage
+
+The existing Windows Task Scheduler task can continue running
+`website_data_scraper.py` at 10:30; do not create a second schedule. After all
+three NIMMS reports finish downloading, the script invokes the dashboard
+importer. This integration is for NIMMS only; Surya remains on the existing
+manual upload flow until its separate source is provided. The default
+dashboard path is
+`C:\Users\ASUS\Downloads\rishu (2)\rishu`; set `DASHBOARD_APP_DIR` if the
+project is installed elsewhere. The scraper output folder defaults to
+`C:\Users\ASUS\Desktop\nvos_to_db`; set `DASHBOARD_SCRAPER_FOLDER` in both
+the dashboard and scheduled-task environments if that folder is moved.
+
+The importer recognizes the timestamped Admission, Discharge, and Service
+workbooks and selects only the newest complete batch; other recognized files
+in the scraper folder are never imported. That batch replaces the previous
+scraper data and archived scraper rows, while separately uploaded reports are
+preserved. The workbooks are combined through the same report-combining path
+used by manual uploads. Recognized inbox workbooks are removed only after the
+replacement has been persisted successfully.
+
+Scraper status, the latest complete batch, and the manual **Import reports**
+retry action are available inside **Manage data**. If an import fails, source
+workbooks remain in the scraper folder for retry. The database and downloaded
+workbooks are local application data and must not be committed.
+
 ## Keep hospital data private
 
 This application can store patient-identifying information and uploaded

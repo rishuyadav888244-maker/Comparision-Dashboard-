@@ -20,6 +20,7 @@ import backend
 import database
 import dashboard_service
 import prediction_service
+import scraper_importer
 
 
 ROOT = Path(__file__).resolve().parent
@@ -83,6 +84,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json_response({
                     "uploads": dashboard_service.list_report_uploads(hospital_name)
                 })
+            elif request.path == "/api/scraper/status":
+                self._json_response(scraper_importer.get_scraper_status())
             elif request.path == "/api/comparison/options":
                 self._json_response(dashboard_service.comparison_options())
             elif request.path == "/api/dashboard":
@@ -172,6 +175,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     payload.get("uploadId"),
                     payload.get("included"),
                 )
+                self._json_response({"success": True, "result": result})
+            elif request.path == "/api/scraper/import":
+                result = scraper_importer.import_scraper_folder()
                 self._json_response({"success": True, "result": result})
             else:
                 self._json_response({"error": "Not found."}, status=404)

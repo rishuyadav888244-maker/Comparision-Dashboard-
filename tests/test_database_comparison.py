@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,31 @@ class DatabaseComparisonPipelineTests(unittest.TestCase):
 
     def load_master(self):
         return backend.clean_data(database.load_all_hospital_data())
+
+    def test_database_initialization_is_safe_for_concurrent_requests(self):
+        original_database_path = database.DATABASE_PATH
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database.DATABASE_PATH = Path(temp_dir) / "concurrent.db"
+            try:
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    list(executor.map(lambda _: database.init_database(), range(16)))
+
+                with database._connect() as connection:
+                    tables = {
+                        row["name"]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                    journal_mode = connection.execute(
+                        "PRAGMA journal_mode"
+                    ).fetchone()[0]
+            finally:
+                database.DATABASE_PATH = original_database_path
+
+        self.assertIn("hospital_data", tables)
+        self.assertIn("raw_report_uploads", tables)
+        self.assertEqual(journal_mode.casefold(), "wal")
 
     def test_dataset_fetch_uses_dataset_and_row_order_index(self):
         dataset_id = database.list_saved_datasets()[0]["dataset_id"]
