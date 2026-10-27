@@ -997,6 +997,7 @@ function renderInsights(insights = {}, charts = {}, kpis = {}) {
     const value = document.createElement("strong");
     value.className = "insight-value";
     value.textContent = item.value || "—";
+    value.title = item.value || "—";
     row.append(icon, label, value);
     grid.append(row);
   });
